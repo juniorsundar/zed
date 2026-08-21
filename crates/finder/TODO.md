@@ -13,7 +13,7 @@
   `open_path_at_position` previews and highlights the target line without
   modifying the upstream Picker or picker-preview crates.
 - [ ] Command-driven previews.
-- [ ] `run_command` Outcome.
+- [x] `run_command` Outcome.
 - [ ] Configurable Source working directory.
 - [ ] Source-result caching.
 - [ ] Directory-of-files configuration.
