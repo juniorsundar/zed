@@ -15,14 +15,15 @@ use std::sync::Arc;
 use workspace::Workspace;
 
 pub use config::{
-    FinderConfig, Outcome, ParsedConfig, Source, parse_config, substitute_args, substitute_json,
+    FinderConfig, Outcome, ParsedConfig, Preview, Source, parse_config, substitute_args,
+    substitute_json,
 };
 pub use delegate::{FinderDelegate, FinderPicker};
 pub use list::FinderList;
 pub use registry::{CONFIG_FILE_NAME, FinderListEntry, FinderLookup, FinderRegistry};
 pub use source::{
-    DefaultSourceRunner, MAX_OUTPUT_BYTES, SOURCE_TIMEOUT, SourceFailure, SourceRunner, run_source,
-    set_source_runner,
+    DefaultSourceRunner, FLUSH_INTERVAL, MAX_ENTRIES, SOURCE_TIMEOUT, SourceEvent, SourceFailure,
+    SourceRunner, SourceStream, SourceUpdate, run_source, set_source_runner,
 };
 
 /// Opens a configured Finder by name.

@@ -26,6 +26,17 @@ pub enum Outcome {
     },
 }
 
+/// What the Preview pane shows for the selected Entry.
+///
+/// Tagged rather than a bare boolean so that a Preview driven by a command can
+/// be added without breaking configs.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Preview {
+    /// The Entry names a file; show its contents.
+    Path,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct FinderConfig {
     pub name: SharedString,
@@ -33,6 +44,7 @@ pub struct FinderConfig {
     pub placeholder: SharedString,
     pub source: Source,
     pub outcome: Outcome,
+    pub preview: Option<Preview>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -42,6 +54,8 @@ struct FinderBody {
     placeholder: Option<SharedString>,
     source: Source,
     outcome: Outcome,
+    #[serde(default)]
+    preview: Option<Preview>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -97,6 +111,7 @@ impl FinderBody {
             placeholder,
             source: self.source,
             outcome: self.outcome,
+            preview: self.preview,
         }
     }
 }
@@ -335,6 +350,50 @@ mod tests {
                 args: vec!["ls-files".into(), "--cached".into(), "--others".into()],
             }
         );
+    }
+
+    #[test]
+    fn a_finder_has_no_preview_unless_it_asks_for_one() {
+        let parsed = parse_ok(
+            r#"
+            [finder.plain]
+            source = { type = "command", command = "git" }
+            outcome = { type = "open_path" }
+            "#,
+        );
+
+        let finder = parsed.finders.get("plain").expect("finder present");
+        assert_eq!(finder.preview, None);
+    }
+
+    #[test]
+    fn a_path_preview_is_declared_explicitly() {
+        let parsed = parse_ok(
+            r#"
+            [finder.files]
+            source = { type = "command", command = "git" }
+            outcome = { type = "open_path" }
+            preview = { type = "path" }
+            "#,
+        );
+
+        let finder = parsed.finders.get("files").expect("finder present");
+        assert_eq!(finder.preview, Some(Preview::Path));
+    }
+
+    #[test]
+    fn an_unknown_preview_type_is_rejected() {
+        let parsed = parse_ok(
+            r#"
+            [finder.futuristic]
+            source = { type = "command", command = "git" }
+            outcome = { type = "open_path" }
+            preview = { type = "command", command = "bat" }
+            "#,
+        );
+
+        assert!(parsed.finders.is_empty());
+        assert!(parsed.errors.contains_key("futuristic"));
     }
 
     #[test]
