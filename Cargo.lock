@@ -6491,6 +6491,7 @@ dependencies = [
  "menu",
  "paths",
  "picker",
+ "picker_preview",
  "project",
  "schemars 1.0.4",
  "serde",
