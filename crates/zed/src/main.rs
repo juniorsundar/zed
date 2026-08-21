@@ -736,6 +736,7 @@ fn main() {
 
         go_to_line::init(cx);
         file_finder::init(cx);
+        finder::init(fs.clone(), cx);
         tab_switcher::init(cx);
         outline::init(cx);
         call_hierarchy::init(cx);

@@ -6460,6 +6460,34 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d45db016d36b838f563236e9193d0ee6ce38f3f68b6c94e914b4929c96bbb890"
 
 [[package]]
+name = "finder"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "collections",
+ "editor",
+ "fs",
+ "futures 0.3.32",
+ "fuzzy_nucleo",
+ "gpui",
+ "menu",
+ "paths",
+ "picker",
+ "project",
+ "schemars 1.0.4",
+ "serde",
+ "serde_json",
+ "settings",
+ "theme",
+ "theme_settings",
+ "toml 0.8.23",
+ "ui",
+ "util",
+ "workspace",
+]
+
+[[package]]
 name = "fixedbitset"
 version = "0.5.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -22782,6 +22810,7 @@ dependencies = [
  "feature_flags",
  "feedback",
  "file_finder",
+ "finder",
  "fs",
  "futures 0.3.32",
  "git",
