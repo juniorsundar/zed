@@ -1,6 +1,6 @@
 use crate::{
     config::{FinderConfig, Preview},
-    outcome::{apply_outcome, resolve_entry_path},
+    outcome::{apply_outcome, resolve_outcome_path},
     source::{MAX_ENTRIES, SourceUpdate, run_source, source_runner},
 };
 use collections::HashMap;
@@ -75,6 +75,22 @@ impl Focusable for FinderPicker {
 
 impl EventEmitter<DismissEvent> for FinderPicker {}
 impl ModalView for FinderPicker {}
+
+/// A Preview that shows text instead of a file, with `subject` emphasized.
+fn message_preview(subject: &str, reason: Option<&str>, cx: &App) -> PreviewUpdate {
+    let mut message = HighlightedTextBuilder::default();
+    message.push_styled(
+        subject,
+        HighlightStyle {
+            color: Some(cx.theme().colors().text_accent),
+            ..Default::default()
+        },
+    );
+    if let Some(reason) = reason {
+        message.push_plain(format!(" {reason}."));
+    }
+    PreviewUpdate::message(message.build())
+}
 
 /// How far the Source has got. Entries can arrive before any of these settle,
 /// and can outlive a failure, so this is not a state machine over the list.
@@ -322,6 +338,7 @@ impl PickerDelegate for FinderDelegate {
         };
 
         let outcome = self.config.outcome.clone();
+        let delimiter = self.config.delimiter.clone();
         let workspace = self.workspace.clone();
         let cwd = self.cwd.clone();
 
@@ -329,7 +346,15 @@ impl PickerDelegate for FinderDelegate {
         // covering rather than on the modal itself.
         self.dismissed(window, cx);
         cx.defer_in(window, move |_, window, cx| {
-            apply_outcome(&outcome, &entry, cwd.as_ref(), &workspace, window, cx);
+            apply_outcome(
+                &outcome,
+                &entry,
+                cwd.as_ref(),
+                delimiter.as_deref(),
+                &workspace,
+                window,
+                cx,
+            );
         });
     }
 
@@ -344,7 +369,19 @@ impl PickerDelegate for FinderDelegate {
             return None;
         };
         let entry = self.matches.get(self.selected_index)?;
-        let path = resolve_entry_path(&entry.string, &self.cwd);
+
+        // The path comes from the Outcome, so what is shown is the file that
+        // confirming would open.
+        let resolved = resolve_outcome_path(
+            &self.config.outcome,
+            &entry.string,
+            &self.cwd,
+            self.config.delimiter.as_deref(),
+        )?;
+        let path = match resolved {
+            Ok(target) => target.path,
+            Err(error) => return Some(message_preview(&error, None, cx)),
+        };
 
         // Only a path inside the project can be classified here, because this
         // runs synchronously and the filesystem cannot be consulted. A path
@@ -357,16 +394,7 @@ impl PickerDelegate for FinderDelegate {
                 None => Some("no longer exists"),
             };
             if let Some(reason) = reason {
-                let mut message = HighlightedTextBuilder::default();
-                message.push_styled(
-                    path.display(),
-                    HighlightStyle {
-                        color: Some(cx.theme().colors().text_accent),
-                        ..Default::default()
-                    },
-                );
-                message.push_plain(format!(" {reason}."));
-                return Some(PreviewUpdate::message(message.build()));
+                return Some(message_preview(&path.display().to_string(), Some(reason), cx));
             }
         }
 

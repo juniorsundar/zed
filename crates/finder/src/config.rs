@@ -18,12 +18,40 @@ pub enum Source {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Outcome {
-    OpenPath,
+    OpenPath {
+        /// Defaults to the whole Entry.
+        #[serde(default)]
+        path: Option<String>,
+    },
+    /// Like [`OpenPath`](Outcome::OpenPath), but the result is read as a path
+    /// with a trailing `:row:col`, and the editor jumps there.
+    OpenPathAtPosition {
+        #[serde(default)]
+        path: Option<String>,
+    },
     DispatchAction {
         action: String,
         #[serde(default)]
         args: Option<serde_json::Value>,
     },
+}
+
+impl Outcome {
+    /// The template naming the path, for the Outcomes that open one. The
+    /// Preview uses this so that what it shows is what Confirm will open.
+    pub fn path_template(&self) -> Option<&str> {
+        match self {
+            Outcome::OpenPath { path } | Outcome::OpenPathAtPosition { path } => {
+                Some(path.as_deref().unwrap_or(WHOLE_ENTRY))
+            }
+            Outcome::DispatchAction { .. } => None,
+        }
+    }
+
+    /// Whether the path this Outcome produces carries a `:row:col` suffix.
+    pub fn path_carries_position(&self) -> bool {
+        matches!(self, Outcome::OpenPathAtPosition { .. })
+    }
 }
 
 /// What the Preview pane shows for the selected Entry.
@@ -45,6 +73,8 @@ pub struct FinderConfig {
     pub source: Source,
     pub outcome: Outcome,
     pub preview: Option<Preview>,
+    /// What separates an Entry's Fields. `None` means runs of whitespace.
+    pub delimiter: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -56,6 +86,8 @@ struct FinderBody {
     outcome: Outcome,
     #[serde(default)]
     preview: Option<Preview>,
+    #[serde(default)]
+    delimiter: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -112,33 +144,129 @@ impl FinderBody {
             source: self.source,
             outcome: self.outcome,
             preview: self.preview,
+            delimiter: self.delimiter,
         }
     }
 }
 
-/// Replaces every `{}` in `args` with `entry`.
-pub fn substitute_args(args: &[String], entry: &str) -> Vec<String> {
-    args.iter().map(|arg| arg.replace("{}", entry)).collect()
+pub const WHOLE_ENTRY: &str = "{}";
+
+/// Why a template could not be applied to an Entry.
+///
+/// Naming a Field an Entry does not have is reported rather than substituted
+/// empty: an Outcome that silently opens `""` or dispatches an action with a
+/// blank argument is a mistake the user cannot see.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MissingField {
+    pub index: usize,
+    pub entry: String,
+    pub available: usize,
 }
 
-/// Replaces every `{}` in every string leaf of `value` with `entry`.
-pub fn substitute_json(value: &serde_json::Value, entry: &str) -> serde_json::Value {
-    match value {
-        serde_json::Value::String(text) => serde_json::Value::String(text.replace("{}", entry)),
+impl std::fmt::Display for MissingField {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "`{{{}}}` needs field {} but `{}` has {}",
+            self.index, self.index, self.entry, self.available
+        )
+    }
+}
+
+/// Divides an Entry into Fields. With no delimiter, runs of whitespace
+/// separate them, which is what column output like `docker ps` produces.
+pub fn fields<'a>(entry: &'a str, delimiter: Option<&str>) -> Vec<&'a str> {
+    match delimiter {
+        Some(delimiter) if !delimiter.is_empty() => entry.split(delimiter).collect(),
+        _ => entry.split_whitespace().collect(),
+    }
+}
+
+/// Replaces `{}` with the whole Entry and `{n}` with its nth Field, counting
+/// from 1. Anything else in braces is left alone.
+pub fn substitute(
+    template: &str,
+    entry: &str,
+    delimiter: Option<&str>,
+) -> Result<String, MissingField> {
+    if !template.contains('{') {
+        return Ok(template.to_owned());
+    }
+
+    let mut split = None;
+    let mut result = String::with_capacity(template.len());
+    let mut rest = template;
+
+    while let Some(start) = rest.find('{') {
+        result.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        let Some(end) = after.find('}') else {
+            result.push_str(&rest[start..]);
+            return Ok(result);
+        };
+
+        let placeholder = &after[..end];
+        if placeholder.is_empty() {
+            result.push_str(entry);
+        } else if let Ok(index) = placeholder.parse::<usize>()
+            && index > 0
+        {
+            let split = split.get_or_insert_with(|| fields(entry, delimiter));
+            let field = split.get(index - 1).ok_or_else(|| MissingField {
+                index,
+                entry: entry.to_owned(),
+                available: split.len(),
+            })?;
+            result.push_str(field);
+        } else {
+            // Not a placeholder we understand; leave it as written.
+            result.push('{');
+            result.push_str(placeholder);
+            result.push('}');
+        }
+
+        rest = &after[end + 1..];
+    }
+
+    result.push_str(rest);
+    Ok(result)
+}
+
+/// Applies [`substitute`] to every argument.
+pub fn substitute_args(
+    args: &[String],
+    entry: &str,
+    delimiter: Option<&str>,
+) -> Result<Vec<String>, MissingField> {
+    args.iter()
+        .map(|arg| substitute(arg, entry, delimiter))
+        .collect()
+}
+
+/// Applies [`substitute`] to every string leaf of `value`.
+pub fn substitute_json(
+    value: &serde_json::Value,
+    entry: &str,
+    delimiter: Option<&str>,
+) -> Result<serde_json::Value, MissingField> {
+    Ok(match value {
+        serde_json::Value::String(text) => {
+            serde_json::Value::String(substitute(text, entry, delimiter)?)
+        }
         serde_json::Value::Array(items) => serde_json::Value::Array(
             items
                 .iter()
-                .map(|item| substitute_json(item, entry))
-                .collect(),
+                .map(|item| substitute_json(item, entry, delimiter))
+                .collect::<Result<_, _>>()?,
         ),
         serde_json::Value::Object(entries) => serde_json::Value::Object(
             entries
                 .iter()
-                .map(|(key, value)| (key.clone(), substitute_json(value, entry)))
-                .collect(),
+                .map(|(key, value)| Ok((key.clone(), substitute_json(value, entry, delimiter)?)))
+                .collect::<Result<_, MissingField>>()?,
         ),
         other => other.clone(),
-    }
+    })
 }
 
 #[cfg(test)]
@@ -169,7 +297,7 @@ mod tests {
                 args: vec!["ls-files".into()],
             }
         );
-        assert_eq!(finder.outcome, Outcome::OpenPath);
+        assert_eq!(finder.outcome, Outcome::OpenPath { path: None });
     }
 
     #[test]
@@ -397,9 +525,116 @@ mod tests {
     }
 
     #[test]
+    fn a_delimiter_and_a_path_template_round_trip() {
+        let parsed = parse_ok(
+            r#"
+            [finder.grep]
+            delimiter = ":"
+            source = { type = "command", command = "rg" }
+            outcome = { type = "open_path_at_position", path = "{1}:{2}:{3}" }
+            "#,
+        );
+
+        let finder = parsed.finders.get("grep").expect("finder present");
+        assert_eq!(finder.delimiter.as_deref(), Some(":"));
+        assert_eq!(
+            finder.outcome,
+            Outcome::OpenPathAtPosition {
+                path: Some("{1}:{2}:{3}".into()),
+            }
+        );
+        assert!(finder.outcome.path_carries_position());
+    }
+
+    #[test]
+    fn an_outcome_without_a_path_template_defaults_to_the_whole_entry() {
+        assert_eq!(
+            Outcome::OpenPath { path: None }.path_template(),
+            Some(WHOLE_ENTRY)
+        );
+        assert_eq!(
+            Outcome::DispatchAction {
+                action: "zed::OpenBrowser".into(),
+                args: None,
+            }
+            .path_template(),
+            None
+        );
+    }
+
+    #[test]
+    fn fields_default_to_splitting_on_whitespace_runs() {
+        assert_eq!(fields("  M   src/main.rs ", None), vec!["M", "src/main.rs"]);
+    }
+
+    #[test]
+    fn an_explicit_delimiter_keeps_empty_fields() {
+        assert_eq!(fields("a::b", Some(":")), vec!["a", "", "b"]);
+    }
+
+    #[test]
+    fn a_numbered_placeholder_names_a_field_from_one() {
+        assert_eq!(
+            substitute("{2}", "abc1234 Fix the crash", None),
+            Ok("Fix".to_string())
+        );
+    }
+
+    #[test]
+    fn the_bare_placeholder_still_means_the_whole_entry() {
+        assert_eq!(
+            substitute("{}", "abc1234 Fix the crash", None),
+            Ok("abc1234 Fix the crash".to_string())
+        );
+    }
+
+    #[test]
+    fn placeholders_mix_with_surrounding_text() {
+        assert_eq!(
+            substitute("{1}:{2}", "src/a.rs:12:3:text", Some(":")),
+            Ok("src/a.rs:12".to_string())
+        );
+    }
+
+    #[test]
+    fn naming_a_field_that_is_not_there_is_an_error() {
+        assert_eq!(
+            substitute("{4}", "one two", None),
+            Err(MissingField {
+                index: 4,
+                entry: "one two".into(),
+                available: 2,
+            })
+        );
+    }
+
+    /// Braces that are not placeholders belong to the user's text — a stash
+    /// name like `stash@{0}` must survive untouched.
+    #[test]
+    fn unrecognised_braces_are_left_alone() {
+        assert_eq!(
+            substitute("stash@{0} {1}", "stash@{0}: WIP", Some(": ")),
+            Ok("stash@{0} stash@{0}".to_string())
+        );
+    }
+
+    #[test]
+    fn an_unclosed_brace_is_left_alone() {
+        assert_eq!(substitute("{1", "one two", None), Ok("{1".to_string()));
+    }
+
+    #[test]
+    fn a_missing_field_in_action_arguments_is_reported(
+    ) {
+        let value = serde_json::json!({ "name": "{9}" });
+        assert!(substitute_json(&value, "one two", None).is_err());
+    }
+
+    #[test]
     fn substitution_replaces_every_placeholder_in_args() {
         assert_eq!(
-            substitute_args(&["log".into(), "{}".into(), "{}..HEAD".into()], "main"),
+            substitute_args(&["log".into(), "{}".into(), "{}..HEAD".into()], "main", None)
+                .expect("no fields named"),
             vec!["log".to_string(), "main".to_string(), "main..HEAD".to_string()]
         );
     }
@@ -407,7 +642,7 @@ mod tests {
     #[test]
     fn substitution_leaves_args_without_a_placeholder_alone() {
         assert_eq!(
-            substitute_args(&["ls-files".into()], "main"),
+            substitute_args(&["ls-files".into()], "main", None).expect("no fields named"),
             vec!["ls-files".to_string()]
         );
     }
@@ -420,7 +655,7 @@ mod tests {
         });
 
         assert_eq!(
-            substitute_json(&value, "main"),
+            substitute_json(&value, "main", None).expect("no fields named"),
             serde_json::json!({
                 "name": "main",
                 "nested": { "deep": ["main", 7, true] },

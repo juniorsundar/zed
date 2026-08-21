@@ -9,7 +9,9 @@ use crate::{
         test_support::{ScriptedRunner, Step, emitting, exit_ok, exit_with},
     },
 };
+use editor::Editor;
 use gpui::{AppContext as _, Entity, TestAppContext, VisualTestContext};
+use multi_buffer::MultiBufferOffset;
 use picker::{Picker, PickerDelegate as _, PreviewSource};
 use project::Project;
 use serde_json::json;
@@ -75,7 +77,13 @@ async fn setup_with_runner<'a>(
     fake_fs
         .insert_tree(
             Path::new("/project"),
-            json!({ "a.rs": "", "b.rs": "", "notes.md": "", "sub": { "c.rs": "" } }),
+            json!({
+                "a.rs": "",
+                "b.rs": "",
+                "notes.md": "",
+                "multi.rs": "one\ntwo\nthree\n",
+                "sub": { "c.rs": "" },
+            }),
         )
         .await;
     fake_fs
@@ -477,6 +485,98 @@ async fn confirming_a_dispatch_action_outcome_substitutes_the_entry(cx: &mut Tes
     let recorded = recorded.lock().expect("lock").clone();
     assert_eq!(recorded, vec!["picked-a.rs".to_string()]);
     assert!(active_finder(&harness, cx).is_none(), "the modal dismissed");
+}
+
+/// `git status --porcelain` shape: the path is the second Field.
+#[gpui::test]
+async fn an_outcome_opens_the_path_named_by_a_field(cx: &mut TestAppContext) {
+    let (harness, cx) = setup(
+        r#"
+        [finder.demo]
+        source = { type = "command", command = "list" }
+        outcome = { type = "open_path", path = "{2}" }
+        "#,
+        emitting(&[" M a.rs"]),
+        cx,
+    )
+    .await;
+
+    open_demo(cx);
+    cx.run_until_parked();
+    cx.dispatch_action(menu::Confirm);
+    cx.run_until_parked();
+
+    let opened = harness.workspace.read_with(cx, |workspace, cx| {
+        workspace
+            .active_item(cx)
+            .and_then(|item| item.project_path(cx))
+            .map(|path| path.path.to_string())
+    });
+    assert_eq!(opened.as_deref(), Some("a.rs"));
+}
+
+/// A ripgrep-shaped Entry: the trailing `:row:col` moves the cursor, and the
+/// matched text after it is ignored.
+#[gpui::test]
+async fn an_outcome_can_jump_to_a_row_and_column(cx: &mut TestAppContext) {
+    let (harness, cx) = setup(
+        r#"
+        [finder.demo]
+        delimiter = ":"
+        source = { type = "command", command = "list" }
+        outcome = { type = "open_path_at_position", path = "{1}:{2}:{3}" }
+        "#,
+        emitting(&["multi.rs:3:2:three"]),
+        cx,
+    )
+    .await;
+
+    open_demo(cx);
+    cx.run_until_parked();
+    cx.dispatch_action(menu::Confirm);
+    cx.run_until_parked();
+
+    let editor = harness
+        .workspace
+        .read_with(cx, |workspace, cx| {
+            workspace
+                .active_item(cx)
+                .and_then(|item| item.downcast::<Editor>())
+        })
+        .expect("the file opened in an editor");
+
+    // "one\ntwo\nthree\n": row 3, column 2 is the `h` at offset 9.
+    let head = editor.update_in(cx, |editor, window, cx| {
+        let snapshot = editor.snapshot(window, cx);
+        editor.selections.newest::<MultiBufferOffset>(&snapshot).head()
+    });
+    assert_eq!(head, MultiBufferOffset(9));
+}
+
+/// A Finder that names a Field its Entries do not have reports the mistake
+/// rather than opening something empty.
+#[gpui::test]
+async fn naming_a_missing_field_reports_instead_of_opening(cx: &mut TestAppContext) {
+    let (harness, cx) = setup(
+        r#"
+        [finder.demo]
+        source = { type = "command", command = "list" }
+        outcome = { type = "open_path", path = "{3}" }
+        "#,
+        emitting(&["a.rs"]),
+        cx,
+    )
+    .await;
+
+    open_demo(cx);
+    cx.run_until_parked();
+    cx.dispatch_action(menu::Confirm);
+    cx.run_until_parked();
+
+    let opened = harness
+        .workspace
+        .read_with(cx, |workspace, cx| workspace.active_item(cx).is_some());
+    assert!(!opened, "nothing should have been opened");
 }
 
 fn preview_target(
