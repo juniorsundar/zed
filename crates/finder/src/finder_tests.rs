@@ -1,5 +1,6 @@
 use crate::{
     Open,
+    QUERY_DEBOUNCE,
     delegate::{FinderDelegate, FinderPicker},
     init_with_registry,
     registry::FinderRegistry,
@@ -40,6 +41,15 @@ const PREVIEW_CONFIG: &str = r#"
     preview = { type = "path" }
 "#;
 
+/// A query-driven Finder: the typed Query is substituted into `args` and the
+/// command re-runs per Query. Its output is the result set.
+const QUERY_CONFIG: &str = r#"
+    [finder.demo]
+    label = "Demo"
+    source = { type = "query", command = "rg", args = ["--files", "{query}"] }
+    outcome = { type = "open_path" }
+"#;
+
 fn init_test(cx: &mut TestAppContext) -> Arc<AppState> {
     cx.update(|cx| {
         let state = AppState::test(cx);
@@ -53,16 +63,44 @@ struct Harness {
     workspace: Entity<Workspace>,
 }
 
+struct HarnessWithRunner {
+    harness: Harness,
+    runner: Arc<ScriptedRunner>,
+}
+
 async fn setup<'a>(
     config: &'static str,
     steps: Vec<Step>,
     cx: &'a mut TestAppContext,
 ) -> (Harness, &'a mut VisualTestContext) {
-    setup_with_runner(config, ScriptedRunnerSpec::Steps(steps), cx).await
+    let (with_runner, cx) = setup_with_runner(config, ScriptedRunnerSpec::Steps(steps), cx).await;
+    (with_runner.harness, cx)
+}
+
+/// Sets up a query-driven Finder whose runner answers each `spawn` with the
+/// next entry in `per_spawn`, in order.
+async fn setup_query<'a>(
+    config: &'static str,
+    per_spawn: Vec<Vec<Step>>,
+    cx: &'a mut TestAppContext,
+) -> (Harness, &'a mut VisualTestContext) {
+    let (with_runner, cx) = setup_with_runner(config, ScriptedRunnerSpec::PerSpawn(per_spawn), cx).await;
+    (with_runner.harness, cx)
+}
+
+/// Like [`setup_query`] but also returns the installed runner, so a test can
+/// inspect the args each spawn received.
+async fn setup_query_with_runner<'a>(
+    config: &'static str,
+    per_spawn: Vec<Vec<Step>>,
+    cx: &'a mut TestAppContext,
+) -> (HarnessWithRunner, &'a mut VisualTestContext) {
+    setup_with_runner(config, ScriptedRunnerSpec::PerSpawn(per_spawn), cx).await
 }
 
 enum ScriptedRunnerSpec {
     Steps(Vec<Step>),
+    PerSpawn(Vec<Vec<Step>>),
     SpawnError(&'static str),
 }
 
@@ -70,7 +108,7 @@ async fn setup_with_runner<'a>(
     config: &'static str,
     spec: ScriptedRunnerSpec,
     cx: &'a mut TestAppContext,
-) -> (Harness, &'a mut VisualTestContext) {
+) -> (HarnessWithRunner, &'a mut VisualTestContext) {
     let app_state = init_test(cx);
     let fake_fs = app_state.fs.as_fake();
 
@@ -91,14 +129,18 @@ async fn setup_with_runner<'a>(
         .await;
 
     let executor = cx.executor();
+    let runner = Arc::new(match spec {
+        ScriptedRunnerSpec::Steps(steps) => ScriptedRunner::new(steps, executor.clone()),
+        ScriptedRunnerSpec::PerSpawn(per_spawn) => {
+            ScriptedRunner::per_spawn(per_spawn, executor.clone())
+        }
+        ScriptedRunnerSpec::SpawnError(reason) => {
+            ScriptedRunner::failing_to_spawn(reason, executor.clone())
+        }
+    });
+    let runner_handle = runner.clone();
     cx.update(|cx| {
-        let runner = match spec {
-            ScriptedRunnerSpec::Steps(steps) => ScriptedRunner::new(steps, executor.clone()),
-            ScriptedRunnerSpec::SpawnError(reason) => {
-                ScriptedRunner::failing_to_spawn(reason, executor.clone())
-            }
-        };
-        set_source_runner(Arc::new(runner), cx);
+        set_source_runner(runner, cx);
         let registry =
             cx.new(|cx| FinderRegistry::new(app_state.fs.clone(), PathBuf::from(CONFIG_PATH), cx));
         init_with_registry(registry, cx);
@@ -110,7 +152,10 @@ async fn setup_with_runner<'a>(
         cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
     let workspace = multi_workspace.read_with(cx, |multi, _| multi.workspace().clone());
 
-    (Harness { workspace }, cx)
+    (HarnessWithRunner {
+        harness: Harness { workspace },
+        runner: runner_handle,
+    }, cx)
 }
 
 fn open_demo(cx: &mut VisualTestContext) {
@@ -331,12 +376,13 @@ async fn filters_entries_by_the_typed_query(cx: &mut TestAppContext) {
 
 #[gpui::test]
 async fn a_failing_source_explains_itself_in_the_empty_state(cx: &mut TestAppContext) {
-    let (harness, cx) = setup_with_runner(
+    let (with_runner, cx) = setup_with_runner(
         OPEN_PATH_CONFIG,
         ScriptedRunnerSpec::SpawnError("No such file or directory"),
         cx,
     )
     .await;
+    let harness = with_runner.harness;
 
     open_demo(cx);
     cx.run_until_parked();
@@ -644,6 +690,203 @@ async fn an_entry_that_is_not_a_file_previews_a_message(cx: &mut TestAppContext)
         message.text.contains("no longer exists"),
         "got {:?}",
         message.text
+    );
+}
+
+/// A query-driven Finder shows nothing while the Query is empty: the Source
+/// is suppressed, not run with an empty pattern.
+#[gpui::test]
+async fn a_query_driven_finder_runs_nothing_until_the_user_types(cx: &mut TestAppContext) {
+    let (harness, cx) = setup_query(
+        QUERY_CONFIG,
+        vec![emitting(&["a.rs", "b.rs"])],
+        cx,
+    )
+    .await;
+
+    open_demo(cx);
+    cx.run_until_parked();
+
+    let picker = active_finder(&harness, cx).expect("finder open");
+    assert_eq!(entries(&picker, cx), Vec::<String>::new(), "nothing ran yet");
+    assert_eq!(status(&picker, cx), None, "not running, not failed");
+}
+
+/// Typing a Query spawns the Source with the Query substituted in, and the
+/// Source's output is the result set — no client fuzzy re-match.
+#[gpui::test]
+async fn a_query_driven_source_owns_filtering(cx: &mut TestAppContext) {
+    let (harness, cx) = setup_query(
+        QUERY_CONFIG,
+        vec![emitting(&["a.rs", "b.rs"])],
+        cx,
+    )
+    .await;
+
+    open_demo(cx);
+    cx.run_until_parked();
+
+    cx.simulate_input("foo");
+    // Advance past the debounce and let the run settle.
+    cx.executor().advance_clock(QUERY_DEBOUNCE + FLUSH_INTERVAL * 2);
+    cx.run_until_parked();
+
+    let picker = active_finder(&harness, cx).expect("finder open");
+    assert_eq!(entries(&picker, cx), vec!["a.rs", "b.rs"]);
+}
+
+/// A new Query clears the list first; it never shows answers to the previous
+/// Query while the new run is in flight.
+#[gpui::test]
+async fn a_new_query_clears_the_list_before_the_new_run_lands(cx: &mut TestAppContext) {
+    let (harness, cx) = setup_query(
+        QUERY_CONFIG,
+        vec![
+            emitting(&["a.rs", "b.rs"]),
+            emitting(&["c.rs"]),
+        ],
+        cx,
+    )
+    .await;
+
+    open_demo(cx);
+    cx.run_until_parked();
+
+    cx.simulate_input("foo");
+    cx.executor().advance_clock(QUERY_DEBOUNCE + FLUSH_INTERVAL * 2);
+    cx.run_until_parked();
+    let picker = active_finder(&harness, cx).expect("finder open");
+    assert_eq!(entries(&picker, cx), vec!["a.rs", "b.rs"]);
+
+    // A new Query clears the list synchronously, before the debounce elapses
+    // and before the new run has produced anything.
+    cx.simulate_input("bar");
+    assert_eq!(
+        entries(&picker, cx),
+        Vec::<String>::new(),
+        "the list cleared as soon as the new query arrived"
+    );
+
+    // Once the debounce elapses and the new run lands, its entries appear.
+    cx.executor().advance_clock(QUERY_DEBOUNCE + FLUSH_INTERVAL * 2);
+    cx.run_until_parked();
+    assert_eq!(entries(&picker, cx), vec!["c.rs"]);
+}
+
+/// Emptying the Query suppresses the Source and clears the list.
+#[gpui::test]
+async fn emptying_the_query_suppresses_the_source(cx: &mut TestAppContext) {
+    let (harness, cx) = setup_query(
+        QUERY_CONFIG,
+        vec![emitting(&["a.rs", "b.rs"])],
+        cx,
+    )
+    .await;
+
+    open_demo(cx);
+    cx.run_until_parked();
+
+    cx.simulate_input("foo");
+    cx.executor().advance_clock(QUERY_DEBOUNCE + FLUSH_INTERVAL * 2);
+    cx.run_until_parked();
+    let picker = active_finder(&harness, cx).expect("finder open");
+    assert_eq!(entries(&picker, cx), vec!["a.rs", "b.rs"]);
+
+    // Clear the query. No spawn should run; the list empties.
+    picker.update_in(cx, |picker, window, cx| {
+        picker.set_query("", window, cx);
+    });
+    cx.executor().advance_clock(QUERY_DEBOUNCE + FLUSH_INTERVAL * 2);
+    cx.run_until_parked();
+    assert_eq!(entries(&picker, cx), Vec::<String>::new());
+    assert_eq!(status(&picker, cx), None);
+}
+
+/// A straggler batch from a killed run does not pollute the new run's list.
+#[gpui::test]
+async fn a_straggler_from_a_killed_run_is_ignored(cx: &mut TestAppContext) {
+    // First run emits one line, then waits a long time before exiting — so it
+    // is still in flight when the second Query arrives and kills it. Its late
+    // exit must not reach the second run's list.
+    let (harness, cx) = setup_query(
+        QUERY_CONFIG,
+        vec![
+            vec![
+                Step::Line("stale.rs"),
+                Step::Wait(SOURCE_TIMEOUT * 8),
+                exit_ok(),
+            ],
+            emitting(&["fresh.rs"]),
+        ],
+        cx,
+    )
+    .await;
+
+    open_demo(cx);
+    cx.run_until_parked();
+
+    cx.simulate_input("foo");
+    cx.executor().advance_clock(QUERY_DEBOUNCE + FLUSH_INTERVAL * 2);
+    cx.run_until_parked();
+    let picker = active_finder(&harness, cx).expect("finder open");
+    assert_eq!(entries(&picker, cx), vec!["stale.rs"]);
+
+    cx.simulate_input("bar");
+    cx.executor().advance_clock(QUERY_DEBOUNCE + FLUSH_INTERVAL * 2);
+    cx.run_until_parked();
+    assert_eq!(entries(&picker, cx), vec!["fresh.rs"]);
+
+    // Advance far enough that the killed first run's late exit would have
+    // landed; it must not have added anything.
+    cx.executor().advance_clock(SOURCE_TIMEOUT * 10);
+    cx.run_until_parked();
+    assert_eq!(entries(&picker, cx), vec!["fresh.rs"]);
+}
+
+/// Enter while a query's debounce is still pending makes the run spawn
+/// immediately (bypassing the debounce) and confirms once the result lands.
+#[gpui::test]
+async fn an_enter_during_the_debounce_forces_the_spawn_and_confirms(cx: &mut TestAppContext) {
+    let (harness, cx) = setup_query(QUERY_CONFIG, vec![emitting(&["a.rs"])], cx).await;
+
+    open_demo(cx);
+    cx.run_until_parked();
+
+    // Type a query and confirm immediately, before the debounce elapses.
+    cx.simulate_input("foo");
+    cx.dispatch_action(menu::Confirm);
+    // Do not advance the debounce here: the run was forced to spawn, then the
+    // deferred confirm fires when its entries land.
+    cx.run_until_parked();
+
+    let opened = harness.workspace.read_with(cx, |workspace, cx| {
+        workspace
+            .active_item(cx)
+            .and_then(|item| item.project_path(cx))
+            .map(|path| path.path.to_string())
+    });
+    assert_eq!(opened.as_deref(), Some("a.rs"));
+    assert!(active_finder(&harness, cx).is_none(), "the modal dismissed");
+}
+
+/// The typed Query is substituted for `{query}` in the Source's args before
+/// the process spawns.
+#[gpui::test]
+async fn the_query_is_substituted_into_the_spawned_args(cx: &mut TestAppContext) {
+    let (with_runner, cx) = setup_query_with_runner(QUERY_CONFIG, vec![emitting(&["a.rs"])], cx).await;
+
+    open_demo(cx);
+    cx.run_until_parked();
+
+    cx.simulate_input("foo");
+    cx.executor().advance_clock(QUERY_DEBOUNCE + FLUSH_INTERVAL * 2);
+    cx.run_until_parked();
+
+    let spawned = with_runner.runner.spawned_args();
+    assert_eq!(
+        spawned,
+        vec![vec!["--files".to_string(), "foo".to_string()]],
+        "the query replaced the {{query}} placeholder in args"
     );
 }
 

@@ -15,10 +15,11 @@ use std::sync::Arc;
 use workspace::Workspace;
 
 pub use config::{
-    FinderConfig, MissingField, Outcome, ParsedConfig, Preview, Source, WHOLE_ENTRY, fields,
-    parse_config, substitute, substitute_args, substitute_json,
+    FinderConfig, MissingField, Outcome, ParsedConfig, Preview, Source, QUERY_PLACEHOLDER,
+    WHOLE_ENTRY, fields, has_query_placeholder, parse_config, substitute, substitute_args,
+    substitute_json, substitute_query,
 };
-pub use delegate::{FinderDelegate, FinderPicker};
+pub use delegate::{FinderDelegate, FinderPicker, QUERY_DEBOUNCE};
 pub use list::FinderList;
 pub use registry::{CONFIG_FILE_NAME, FinderListEntry, FinderLookup, FinderRegistry};
 pub use source::{

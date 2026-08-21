@@ -1,5 +1,5 @@
 use crate::{
-    config::{FinderConfig, Preview},
+    config::{FinderConfig, Preview, Source, substitute_query},
     outcome::{apply_outcome, resolve_outcome_path},
     source::{MAX_ENTRIES, SourceUpdate, run_source, source_runner},
 };
@@ -12,7 +12,7 @@ use gpui::{
 };
 use picker::{HighlightedTextBuilder, Picker, PickerDelegate, PreviewUpdate};
 use project::Project;
-use std::{path::Path, sync::Arc};
+use std::{path::Path, sync::Arc, time::Duration};
 use ui::{Color, HighlightedLabel, Icon, IconName, ListItem, ListItemSpacing, prelude::*};
 use util::ResultExt as _;
 use workspace::{ModalView, Workspace};
@@ -33,6 +33,7 @@ impl FinderPicker {
         cx: &mut Context<Self>,
     ) -> Self {
         let previewed = config.preview.is_some();
+        let is_query_driven = config.source.is_query_driven();
         let delegate = FinderDelegate::new(
             cx.entity().downgrade(),
             workspace,
@@ -47,7 +48,12 @@ impl FinderPicker {
             } else {
                 Picker::uniform_list(delegate, window, cx)
             };
-            picker.delegate.source_task = picker.delegate.spawn_source(project, window, cx);
+            // A query-driven Source waits for the first Query; the picker's
+            // opening `update_matches("")` suppresses it.
+            if !is_query_driven {
+                picker.delegate.source_task =
+                    picker.delegate.spawn_source(project, window, cx);
+            }
             picker
         });
         Self { picker }
@@ -92,6 +98,17 @@ fn message_preview(subject: &str, reason: Option<&str>, cx: &App) -> PreviewUpda
     PreviewUpdate::message(message.build())
 }
 
+/// How long after the user stops typing before a query-driven Source is
+/// re-spawned. Short enough to feel live, long enough to coalesce a burst of
+/// keystrokes into one spawn rather than one per character.
+pub const QUERY_DEBOUNCE: Duration = Duration::from_millis(150);
+
+/// Identifies which run of a query-driven Source a batch of Entries belongs
+/// to. When a new Query spawns a new run, the generation is bumped; a straggler
+/// batch from the killed run carries a stale generation and is dropped so it
+/// cannot pollute the new run's list.
+type Generation = u64;
+
 /// How far the Source has got. Entries can arrive before any of these settle,
 /// and can outlive a failure, so this is not a state machine over the list.
 #[derive(Default)]
@@ -111,10 +128,23 @@ pub struct FinderDelegate {
     matches: Vec<StringMatch>,
     selected_index: usize,
     state: SourceState,
-    /// Set when a re-match is caused by Entries arriving rather than by the
-    /// user typing, so the selection does not jump out from under them.
+    /// Set when Entries arrive rather than the user typing, so the selection
+    /// does not jump out from under them.
     keep_selected_entry: bool,
     source_task: Task<()>,
+    /// Present only for a [`Source::Query`].
+    query: Option<QueryState>,
+}
+
+/// The query-driven half of the delegate.
+#[derive(Default)]
+struct QueryState {
+    /// Bumped per run; batches carrying an older generation are ignored.
+    generation: Generation,
+    /// The Query the current run was spawned for.
+    pending_query: Option<String>,
+    /// Wakes a pending debounce early (Enter forces the spawn).
+    force_wake: Option<futures::channel::mpsc::UnboundedSender<()>>,
 }
 
 impl FinderDelegate {
@@ -125,6 +155,7 @@ impl FinderDelegate {
         cwd: Arc<Path>,
         project: Entity<Project>,
     ) -> Self {
+        let is_query_driven = config.source.is_query_driven();
         Self {
             finder,
             workspace,
@@ -140,6 +171,7 @@ impl FinderDelegate {
             },
             keep_selected_entry: false,
             source_task: Task::ready(()),
+            query: is_query_driven.then(QueryState::default),
         }
     }
 
@@ -152,9 +184,13 @@ impl FinderDelegate {
         cx: &mut Context<Picker<Self>>,
     ) -> Task<()> {
         let runner = source_runner(cx);
-        let source = self.config.source.clone();
         let cwd = self.cwd.clone();
         let executor = cx.background_executor().clone();
+        let (command, args) = match &self.config.source {
+            Source::Command { command, args } | Source::Query { command, args } => {
+                (command.clone(), args.clone())
+            }
+        };
 
         let environment = project.update(cx, |project, cx| {
             let worktree = project.visible_worktrees(cx).next()?;
@@ -174,7 +210,8 @@ impl FinderDelegate {
             // child process; that happens when the picker itself is dropped.
             let _source = cx.background_spawn(run_source(
                 runner,
-                source,
+                command,
+                args,
                 cwd,
                 environment,
                 executor,
@@ -192,6 +229,149 @@ impl FinderDelegate {
                 }
             }
         })
+    }
+
+    /// Debounces the Query, then spawns one run of the Source for it. The run
+    /// is tagged with the current generation; batches from a superseded run
+    /// are dropped by [`apply_query`]. The picker awaits the returned Task to
+    /// refresh the preview; dropping it (a new Query) cancels the debounce and
+    /// kills the child.
+    fn update_query_matches(
+        &mut self,
+        query: String,
+        window: &mut Window,
+        cx: &mut Context<Picker<Self>>,
+    ) -> Task<()> {
+        // Empty Query: nothing runs until there is something to search for.
+        if query.is_empty() {
+            self.entries = Arc::new(Vec::new());
+            self.matches.clear();
+            self.selected_index = 0;
+            self.state = SourceState::default();
+            if let Some(query_state) = &mut self.query {
+                query_state.generation = query_state.generation.wrapping_add(1);
+                query_state.pending_query = None;
+            }
+            return Task::ready(());
+        }
+
+        let project = self.project.clone();
+        let cwd = self.cwd.clone();
+        let executor = cx.background_executor().clone();
+        let config = self.config.clone();
+        // Enter short-circuits the debounce through this channel.
+        let (force_tx, force_rx) = mpsc::unbounded::<()>();
+        let generation = {
+            let query_state = self.query.as_mut().expect("query-driven only");
+            query_state.generation = query_state.generation.wrapping_add(1);
+            query_state.pending_query = Some(query.clone());
+            query_state.force_wake = Some(force_tx);
+            query_state.generation
+        };
+
+        // The list is always the answer to the current Query or empty, never a
+        // stale answer to the previous one.
+        self.entries = Arc::new(Vec::new());
+        self.matches.clear();
+        self.selected_index = 0;
+        self.state = SourceState {
+            running: true,
+            ..SourceState::default()
+        };
+        cx.notify();
+
+        let command = config.source.command().to_owned();
+        let args = substitute_query(config.source.args(), &query);
+        let runner = source_runner(cx);
+
+        let environment = project.update(cx, |project, cx| {
+            let worktree = project.visible_worktrees(cx).next()?;
+            Some(project.environment().update(cx, |environment, cx| {
+                environment.worktree_environment(worktree, cx)
+            }))
+        });
+
+        cx.spawn_in(window, async move |picker, cx| {
+            // Debounce, but yield immediately if Enter fires `force_wake`.
+            let mut force_rx = force_rx;
+            let timer = cx.background_executor().timer(QUERY_DEBOUNCE);
+            futures::pin_mut!(timer);
+            let woke = futures::future::select(timer, force_rx.next()).await;
+            let _ = woke;
+            // A newer Query replaced this task in `pending_update_matches`, so
+            // it was dropped and cancelled us; bail if we are stale anyway.
+            let superseded = picker
+                .read_with(cx, |picker, _| {
+                    picker.delegate.query.as_ref()
+                        .map(|state| state.generation != generation)
+                        .unwrap_or(true)
+                })
+                .unwrap_or(true);
+            if superseded {
+                return;
+            }
+
+            let environment = match environment {
+                Some(environment) => environment.await.unwrap_or_default(),
+                None => HashMap::default(),
+            };
+
+            let (sender, mut updates) = mpsc::unbounded();
+            // Dropping the task drops the stream, killing the child.
+            let _source = cx.background_spawn(run_source(
+                runner,
+                command,
+                args,
+                cwd,
+                environment,
+                executor,
+                sender,
+            ));
+
+            while let Some(update) = updates.next().await {
+                let applied = picker.update_in(cx, |picker, _window, cx| {
+                    picker.delegate.apply_query(generation, update);
+                    cx.notify();
+                });
+                if applied.is_err() {
+                    return;
+                }
+            }
+        })
+    }
+
+    /// Drops batches from a superseded run. The Source owns filtering, so
+    /// Entries become Matches directly.
+    fn apply_query(&mut self, generation: Generation, update: SourceUpdate) {
+        let query_state = self.query.as_mut().expect("query-driven only");
+        if generation != query_state.generation {
+            return;
+        }
+        match update {
+            SourceUpdate::Entries(entries) => {
+                let first_id = self.entries.len();
+                Arc::make_mut(&mut self.entries).extend(
+                    entries.iter().enumerate().map(|(offset, entry)| {
+                        StringMatchCandidate::new(first_id + offset, entry.clone())
+                    }),
+                );
+                self.matches.extend(entries.into_iter().map(|entry| StringMatch {
+                    // Unused for rendering; query-driven matches have no highlights.
+                    candidate_id: 0,
+                    score: 0.,
+                    positions: Vec::new(),
+                    string: entry,
+                }));
+            }
+            SourceUpdate::Finished { truncated } => {
+                self.state.running = false;
+                self.state.truncated = truncated;
+            }
+            SourceUpdate::Failed(failure) => {
+                self.state.running = false;
+                self.state.failure = Some(failure.to_string().into());
+            }
+        }
     }
 
     fn apply(&mut self, update: SourceUpdate) {
@@ -278,9 +458,13 @@ impl PickerDelegate for FinderDelegate {
     fn update_matches(
         &mut self,
         query: String,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Picker<Self>>,
     ) -> Task<()> {
+        if self.query.is_some() {
+            return self.update_query_matches(query, window, cx);
+        }
+
         let entries = self.entries.clone();
         let selected_entry = std::mem::take(&mut self.keep_selected_entry)
             .then(|| self.matches.get(self.selected_index))
@@ -328,6 +512,31 @@ impl PickerDelegate for FinderDelegate {
         })
     }
 
+    fn finalize_update_matches(
+        &mut self,
+        _query: String,
+        _duration: Duration,
+        _window: &mut Window,
+        _cx: &mut Context<Picker<Self>>,
+    ) -> bool {
+        // The one-shot path has already produced its matches synchronously, so
+        // there is nothing to finalize.
+        let Some(query_state) = &mut self.query else {
+            return true;
+        };
+
+        // Short-circuit any pending debounce so the run spawns now rather than
+        // after the debounce elapses.
+        if let Some(wake) = query_state.force_wake.take() {
+            wake.unbounded_send(()).ok();
+        }
+
+        // Defer: the pending debounce+drain task completes when the run settles,
+        // and the picker then fires the deferred confirm via `confirm_on_update`.
+        // If there is no pending run at all, there is nothing to wait on.
+        query_state.pending_query.is_none()
+    }
+
     fn confirm(&mut self, _secondary: bool, window: &mut Window, cx: &mut Context<Picker<Self>>) {
         let Some(entry) = self
             .matches
@@ -370,8 +579,7 @@ impl PickerDelegate for FinderDelegate {
         };
         let entry = self.matches.get(self.selected_index)?;
 
-        // The path comes from the Outcome, so what is shown is the file that
-        // confirming would open.
+        // Resolved via the Outcome so the Preview shows what Confirm opens.
         let resolved = resolve_outcome_path(
             &self.config.outcome,
             &entry.string,

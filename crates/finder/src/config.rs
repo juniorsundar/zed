@@ -7,11 +7,54 @@ use std::{collections::BTreeMap, sync::Arc};
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Source {
+    /// Runs once at open; the Query filters its Entries client-side.
     Command {
         command: String,
         #[serde(default)]
         args: Vec<String>,
     },
+    /// Re-runs per Query with [`QUERY_PLACEHOLDER`] substituted into `args`;
+    /// its output is the result set. Rejected at parse time if no arg carries
+    /// the placeholder, since the Query would be silently dropped.
+    Query {
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+    },
+}
+
+impl Source {
+    pub fn command(&self) -> &str {
+        match self {
+            Source::Command { command, .. } | Source::Query { command, .. } => command,
+        }
+    }
+
+    pub fn args(&self) -> &[String] {
+        match self {
+            Source::Command { args, .. } | Source::Query { args, .. } => args,
+        }
+    }
+
+    /// Whether the Source re-runs per Query.
+    pub fn is_query_driven(&self) -> bool {
+        matches!(self, Source::Query { .. })
+    }
+}
+
+pub const QUERY_PLACEHOLDER: &str = "{query}";
+
+/// Replaces every [`QUERY_PLACEHOLDER`] in `args` with `query`. Unlike
+/// [`substitute`], there are no Field semantics to validate.
+pub fn substitute_query(args: &[String], query: &str) -> Vec<String> {
+    args.iter()
+        .map(|arg| arg.replace(QUERY_PLACEHOLDER, query))
+        .collect()
+}
+
+/// Whether any of `args` carries the Query placeholder.
+pub fn has_query_placeholder(args: &[String]) -> bool {
+    args.iter().any(|arg| arg.contains(QUERY_PLACEHOLDER))
 }
 
 /// What happens when an Entry is chosen.
@@ -23,8 +66,8 @@ pub enum Outcome {
         #[serde(default)]
         path: Option<String>,
     },
-    /// Like [`OpenPath`](Outcome::OpenPath), but the result is read as a path
-    /// with a trailing `:row:col`, and the editor jumps there.
+    /// Like [`OpenPath`](Outcome::OpenPath), but the path carries a trailing
+    /// `:row:col` and the editor jumps there.
     OpenPathAtPosition {
         #[serde(default)]
         path: Option<String>,
@@ -37,8 +80,7 @@ pub enum Outcome {
 }
 
 impl Outcome {
-    /// The template naming the path, for the Outcomes that open one. The
-    /// Preview uses this so that what it shows is what Confirm will open.
+    /// The template naming the path, so the Preview shows what Confirm opens.
     pub fn path_template(&self) -> Option<&str> {
         match self {
             Outcome::OpenPath { path } | Outcome::OpenPathAtPosition { path } => {
@@ -48,20 +90,16 @@ impl Outcome {
         }
     }
 
-    /// Whether the path this Outcome produces carries a `:row:col` suffix.
     pub fn path_carries_position(&self) -> bool {
         matches!(self, Outcome::OpenPathAtPosition { .. })
     }
 }
 
-/// What the Preview pane shows for the selected Entry.
-///
-/// Tagged rather than a bare boolean so that a Preview driven by a command can
-/// be added without breaking configs.
+/// What the Preview pane shows. Tagged so a command-driven Preview can be
+/// added without breaking configs.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Preview {
-    /// The Entry names a file; show its contents.
     Path,
 }
 
@@ -73,7 +111,6 @@ pub struct FinderConfig {
     pub source: Source,
     pub outcome: Outcome,
     pub preview: Option<Preview>,
-    /// What separates an Entry's Fields. `None` means runs of whitespace.
     pub delimiter: Option<String>,
 }
 
@@ -97,20 +134,17 @@ struct ConfigFile {
     finder: BTreeMap<String, toml::Value>,
 }
 
-/// The outcome of reading one config file. Finders that failed to deserialize
-/// are kept as errors rather than dropped, so that opening one by name can
-/// report why it is unusable instead of claiming it does not exist.
+/// Finders that failed to deserialize are kept as errors rather than dropped,
+/// so opening one by name can report why it is unusable.
 #[derive(Debug, Default)]
 pub struct ParsedConfig {
     pub finders: BTreeMap<SharedString, Arc<FinderConfig>>,
     pub errors: BTreeMap<SharedString, SharedString>,
 }
 
-/// Parses a whole config file.
-///
 /// Returns `Err` only when the file is not valid TOML at all; a single
-/// malformed Finder is recorded in [`ParsedConfig::errors`] so that its
-/// siblings keep working.
+/// malformed Finder lands in [`ParsedConfig::errors`] so its siblings keep
+/// working.
 pub fn parse_config(contents: &str) -> Result<ParsedConfig> {
     let file: ConfigFile = toml::from_str(contents).context("parsing finder config")?;
 
@@ -118,11 +152,14 @@ pub fn parse_config(contents: &str) -> Result<ParsedConfig> {
     for (name, value) in file.finder {
         let name = SharedString::from(name);
         match value.try_into::<FinderBody>() {
-            Ok(body) => {
-                parsed
-                    .finders
-                    .insert(name.clone(), Arc::new(body.into_config(name)));
-            }
+            Ok(body) => match body.try_into_config(name.clone()) {
+                Ok(config) => {
+                    parsed.finders.insert(name, Arc::new(config));
+                }
+                Err(error) => {
+                    parsed.errors.insert(name, error.to_string().into());
+                }
+            },
             Err(error) => {
                 parsed.errors.insert(name, error.to_string().into());
             }
@@ -132,6 +169,17 @@ pub fn parse_config(contents: &str) -> Result<ParsedConfig> {
 }
 
 impl FinderBody {
+    fn try_into_config(self, name: SharedString) -> Result<FinderConfig> {
+        if matches!(self.source, Source::Query { .. })
+            && !has_query_placeholder(self.source.args())
+        {
+            anyhow::bail!(
+                "a `query` source must put `{{query}}` in its args, or the typed query would be ignored"
+            );
+        }
+        Ok(self.into_config(name))
+    }
+
     fn into_config(self, name: SharedString) -> FinderConfig {
         let label = self.label.unwrap_or_else(|| name.clone());
         let placeholder = self
@@ -151,11 +199,9 @@ impl FinderBody {
 
 pub const WHOLE_ENTRY: &str = "{}";
 
-/// Why a template could not be applied to an Entry.
-///
-/// Naming a Field an Entry does not have is reported rather than substituted
-/// empty: an Outcome that silently opens `""` or dispatches an action with a
-/// blank argument is a mistake the user cannot see.
+/// Why a template could not be applied to an Entry. Reported rather than
+/// substituted empty: silently opening `""` or dispatching a blank argument is
+/// a mistake the user cannot see.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MissingField {
     pub index: usize,
@@ -380,7 +426,7 @@ mod tests {
         let parsed = parse_ok(
             r#"
             [finder.futuristic]
-            source = { type = "query_driven", command = "rg" }
+            source = { type = "futuristic", command = "rg" }
             outcome = { type = "open_path" }
             "#,
         );
@@ -660,6 +706,65 @@ mod tests {
                 "name": "main",
                 "nested": { "deep": ["main", 7, true] },
             })
+        );
+    }
+
+    #[test]
+    fn parses_a_query_driven_finder() {
+        let parsed = parse_ok(
+            r#"
+            [finder.demo]
+            source = { type = "query", command = "rg", args = ["--line-number", "{query}"] }
+            outcome = { type = "open_path" }
+            "#,
+        );
+
+        assert!(parsed.errors.is_empty());
+        let finder = parsed.finders.get("demo").expect("finder present");
+        assert_eq!(
+            finder.source,
+            Source::Query {
+                command: "rg".into(),
+                args: vec!["--line-number".into(), "{query}".into()],
+            }
+        );
+        assert!(finder.source.is_query_driven());
+    }
+
+    #[test]
+    fn a_query_source_without_the_placeholder_is_rejected() {
+        let parsed = parse_ok(
+            r#"
+            [finder.demo]
+            source = { type = "query", command = "rg", args = ["--files"] }
+            outcome = { type = "open_path" }
+            "#,
+        );
+
+        assert!(parsed.finders.is_empty());
+        let error = parsed.errors.get("demo").expect("the finder is broken");
+        assert!(
+            error.contains("{query}"),
+            "expected the error to name the placeholder, got {error}"
+        );
+    }
+
+    #[test]
+    fn substitute_query_replaces_every_placeholder() {
+        assert_eq!(
+            substitute_query(
+                &["rg".into(), "{query}".into(), "--glob=!{query}".into()],
+                "foo",
+            ),
+            vec!["rg", "foo", "--glob=!foo"],
+        );
+    }
+
+    #[test]
+    fn substitute_query_leaves_args_without_the_placeholder_alone() {
+        assert_eq!(
+            substitute_query(&["rg".into(), "--files".into()], "foo"),
+            vec!["rg", "--files"],
         );
     }
 }
