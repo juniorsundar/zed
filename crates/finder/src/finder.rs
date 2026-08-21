@@ -15,8 +15,8 @@ use std::sync::Arc;
 use workspace::Workspace;
 
 pub use config::{
-    FinderConfig, Outcome, ParsedConfig, Preview, Source, parse_config, substitute_args,
-    substitute_json,
+    FinderConfig, MissingField, Outcome, ParsedConfig, Preview, Source, WHOLE_ENTRY, fields,
+    parse_config, substitute, substitute_args, substitute_json,
 };
 pub use delegate::{FinderDelegate, FinderPicker};
 pub use list::FinderList;

@@ -6472,6 +6472,7 @@ dependencies = [
  "fuzzy_nucleo",
  "gpui",
  "menu",
+ "multi_buffer",
  "paths",
  "picker",
  "picker_preview",
