@@ -1,4 +1,3 @@
-use crate::config::Source;
 use async_trait::async_trait;
 use collections::HashMap;
 use futures::{
@@ -39,12 +38,8 @@ pub enum SourceEvent {
 
 pub type SourceStream = Pin<Box<dyn Stream<Item = SourceEvent> + Send>>;
 
-/// The seam between a Source declaration and a real process.
-///
-/// It sits below the timeout, the Entry cap, and the flush policy in
-/// [`run_source`], so that all of those stay under test: a test runner can
-/// yield scripted lines interleaved with timers the test executor advances
-/// past.
+/// The seam between a Source declaration and a real process. Kept below
+/// [`run_source`]'s timeout, cap, and flush policy so those stay under test.
 #[async_trait]
 pub trait SourceRunner: Send + Sync {
     async fn spawn(
@@ -160,12 +155,8 @@ impl fmt::Display for SourceFailure {
     }
 }
 
-/// A batch of Entries, or the reason there will be no more.
-///
-/// Exactly one terminal update — [`Finished`](SourceUpdate::Finished) or
-/// [`Failed`](SourceUpdate::Failed) — is sent, and it is sent last. A Source
-/// may emit Entries and *then* fail, so Entries already delivered stay valid
-/// after a failure.
+/// A batch of Entries, or the reason there will be no more. Exactly one
+/// terminal update is sent, and it is sent last.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SourceUpdate {
     Entries(Vec<SharedString>),
@@ -173,20 +164,16 @@ pub enum SourceUpdate {
     Failed(SourceFailure),
 }
 
-/// Runs a Source, reporting Entries as they arrive.
-///
-/// Batches are coalesced over [`FLUSH_INTERVAL`] so that a fast Source does not
-/// trigger a re-match per line.
+/// Runs a command, coalescing output over [`FLUSH_INTERVAL`].
 pub async fn run_source(
     runner: Arc<dyn SourceRunner>,
-    source: Source,
+    command: String,
+    args: Vec<String>,
     cwd: Arc<Path>,
     env: HashMap<String, String>,
     executor: BackgroundExecutor,
     updates: mpsc::UnboundedSender<SourceUpdate>,
 ) {
-    let Source::Command { command, args } = source;
-
     let mut events = match runner.spawn(&command, &args, cwd.as_ref(), &env).await {
         Ok(events) => events,
         Err(error) => {
@@ -335,26 +322,41 @@ pub(crate) mod test_support {
     }
 
     pub struct ScriptedRunner {
-        steps: Vec<Step>,
+        /// One entry per `spawn` call; extras get `tail`.
+        per_spawn: std::sync::Mutex<Vec<Vec<Step>>>,
         spawn_error: Option<String>,
         executor: BackgroundExecutor,
+        tail: Vec<Step>,
+        spawned_args: std::sync::Mutex<Vec<Vec<String>>>,
     }
 
     impl ScriptedRunner {
         pub fn new(steps: Vec<Step>, executor: BackgroundExecutor) -> Self {
+            Self::per_spawn(vec![steps], executor)
+        }
+
+        pub fn per_spawn(per_spawn: Vec<Vec<Step>>, executor: BackgroundExecutor) -> Self {
             Self {
-                steps,
+                per_spawn: std::sync::Mutex::new(per_spawn),
                 spawn_error: None,
                 executor,
+                tail: vec![exit_ok()],
+                spawned_args: std::sync::Mutex::new(Vec::new()),
             }
         }
 
         pub fn failing_to_spawn(reason: &str, executor: BackgroundExecutor) -> Self {
             Self {
-                steps: Vec::new(),
+                per_spawn: std::sync::Mutex::new(vec![Vec::new()]),
                 spawn_error: Some(reason.to_owned()),
                 executor,
+                tail: vec![exit_ok()],
+                spawned_args: std::sync::Mutex::new(Vec::new()),
             }
+        }
+
+        pub fn spawned_args(&self) -> Vec<Vec<String>> {
+            self.spawned_args.lock().expect("unpoisoned").clone()
         }
     }
 
@@ -363,7 +365,7 @@ pub(crate) mod test_support {
         async fn spawn(
             &self,
             _command: &str,
-            _args: &[String],
+            args: &[String],
             _cwd: &Path,
             _env: &HashMap<String, String>,
         ) -> Result<SourceStream, std::io::Error> {
@@ -371,9 +373,20 @@ pub(crate) mod test_support {
                 return Err(std::io::Error::other(reason.clone()));
             }
 
+            self.spawned_args.lock().expect("unpoisoned").push(args.to_vec());
+
+            let steps = {
+                let mut queue = self.per_spawn.lock().expect("unpoisoned");
+                if !queue.is_empty() {
+                    queue.remove(0)
+                } else {
+                    self.tail.clone()
+                }
+            };
+
             let executor = self.executor.clone();
             Ok(Box::pin(stream::unfold(
-                self.steps.clone().into_iter(),
+                steps.into_iter(),
                 move |mut steps| {
                     let executor = executor.clone();
                     async move {
@@ -404,6 +417,7 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::{test_support::*, *};
+    use crate::config::Source;
     use gpui::TestAppContext;
 
     fn source() -> Source {
@@ -417,9 +431,13 @@ mod tests {
     async fn collect(runner: impl SourceRunner + 'static, cx: &mut TestAppContext) -> Vec<SourceUpdate> {
         let executor = cx.executor();
         let (sender, receiver) = mpsc::unbounded();
+        let Source::Command { command, args } = source() else {
+            unreachable!()
+        };
         let task = cx.background_executor.spawn(run_source(
             Arc::new(runner),
-            source(),
+            command,
+            args,
             Arc::from(Path::new("/project")),
             HashMap::default(),
             executor.clone(),
