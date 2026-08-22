@@ -170,8 +170,7 @@ pub fn parse_config(contents: &str) -> Result<ParsedConfig> {
 
 impl FinderBody {
     fn try_into_config(self, name: SharedString) -> Result<FinderConfig> {
-        if matches!(self.source, Source::Query { .. })
-            && !has_query_placeholder(self.source.args())
+        if matches!(self.source, Source::Query { .. }) && !has_query_placeholder(self.source.args())
         {
             anyhow::bail!(
                 "a `query` source must put `{{query}}` in its args, or the typed query would be ignored"
@@ -358,7 +357,10 @@ mod tests {
 
         let finder = parsed.finders.get("git-branches").expect("finder present");
         assert_eq!(finder.label, SharedString::from("git-branches"));
-        assert_eq!(finder.placeholder, SharedString::from("Search git-branches…"));
+        assert_eq!(
+            finder.placeholder,
+            SharedString::from("Search git-branches…")
+        );
     }
 
     #[test]
@@ -390,7 +392,10 @@ mod tests {
         );
 
         let finder = parsed.finders.get("git-branches").expect("finder present");
-        assert_eq!(finder.placeholder, SharedString::from("Search Git Branches…"));
+        assert_eq!(
+            finder.placeholder,
+            SharedString::from("Search Git Branches…")
+        );
     }
 
     #[test]
@@ -670,8 +675,7 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_field_in_action_arguments_is_reported(
-    ) {
+    fn a_missing_field_in_action_arguments_is_reported() {
         let value = serde_json::json!({ "name": "{9}" });
         assert!(substitute_json(&value, "one two", None).is_err());
     }
@@ -679,9 +683,17 @@ mod tests {
     #[test]
     fn substitution_replaces_every_placeholder_in_args() {
         assert_eq!(
-            substitute_args(&["log".into(), "{}".into(), "{}..HEAD".into()], "main", None)
-                .expect("no fields named"),
-            vec!["log".to_string(), "main".to_string(), "main..HEAD".to_string()]
+            substitute_args(
+                &["log".into(), "{}".into(), "{}..HEAD".into()],
+                "main",
+                None
+            )
+            .expect("no fields named"),
+            vec![
+                "log".to_string(),
+                "main".to_string(),
+                "main..HEAD".to_string()
+            ]
         );
     }
 

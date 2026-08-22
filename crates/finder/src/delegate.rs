@@ -55,8 +55,7 @@ impl FinderPicker {
             // A query-driven Source waits for the first Query; the picker's
             // opening `update_matches("")` suppresses it.
             if !is_query_driven {
-                picker.delegate.source_task =
-                    picker.delegate.spawn_source(project, window, cx);
+                picker.delegate.source_task = picker.delegate.spawn_source(project, window, cx);
             }
             picker
         });
@@ -138,7 +137,7 @@ pub struct FinderDelegate {
     source_task: Task<()>,
     /// Present only for a [`Source::Query`].
     query: Option<QueryState>,
-    pending_position: PendingPosition,
+    pub(crate) pending_position: PendingPosition,
 }
 
 /// The query-driven half of the delegate.
@@ -309,7 +308,10 @@ impl FinderDelegate {
             // it was dropped and cancelled us; bail if we are stale anyway.
             let superseded = picker
                 .read_with(cx, |picker, _| {
-                    picker.delegate.query.as_ref()
+                    picker
+                        .delegate
+                        .query
+                        .as_ref()
                         .map(|state| state.generation != generation)
                         .unwrap_or(true)
                 })
@@ -357,18 +359,17 @@ impl FinderDelegate {
         match update {
             SourceUpdate::Entries(entries) => {
                 let first_id = self.entries.len();
-                Arc::make_mut(&mut self.entries).extend(
-                    entries.iter().enumerate().map(|(offset, entry)| {
-                        StringMatchCandidate::new(first_id + offset, entry.clone())
-                    }),
-                );
-                self.matches.extend(entries.into_iter().map(|entry| StringMatch {
-                    // Unused for rendering; query-driven matches have no highlights.
-                    candidate_id: 0,
-                    score: 0.,
-                    positions: Vec::new(),
-                    string: entry,
-                }));
+                Arc::make_mut(&mut self.entries).extend(entries.iter().enumerate().map(
+                    |(offset, entry)| StringMatchCandidate::new(first_id + offset, entry.clone()),
+                ));
+                self.matches
+                    .extend(entries.into_iter().map(|entry| StringMatch {
+                        // Unused for rendering; query-driven matches have no highlights.
+                        candidate_id: 0,
+                        score: 0.,
+                        positions: Vec::new(),
+                        string: entry,
+                    }));
             }
             SourceUpdate::Finished { truncated } => {
                 self.state.running = false;
@@ -386,9 +387,10 @@ impl FinderDelegate {
             SourceUpdate::Entries(entries) => {
                 let first_id = self.entries.len();
                 Arc::make_mut(&mut self.entries).extend(
-                    entries.into_iter().enumerate().map(|(offset, entry)| {
-                        StringMatchCandidate::new(first_id + offset, entry)
-                    }),
+                    entries
+                        .into_iter()
+                        .enumerate()
+                        .map(|(offset, entry)| StringMatchCandidate::new(first_id + offset, entry)),
                 );
             }
             SourceUpdate::Finished { truncated } => {
@@ -611,7 +613,11 @@ impl PickerDelegate for FinderDelegate {
                 None => Some("no longer exists"),
             };
             if let Some(reason) = reason {
-                return Some(message_preview(&path.display().to_string(), Some(reason), cx));
+                return Some(message_preview(
+                    &path.display().to_string(),
+                    Some(reason),
+                    cx,
+                ));
             }
         }
 
@@ -639,7 +645,11 @@ impl PickerDelegate for FinderDelegate {
                         .size(IconSize::Small)
                         .color(Color::Warning),
                 )
-                .child(Label::new(message).size(LabelSize::Small).color(Color::Muted))
+                .child(
+                    Label::new(message)
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
                 .into_any_element(),
         )
     }

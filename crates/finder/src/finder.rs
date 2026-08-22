@@ -1,7 +1,7 @@
 mod config;
+mod delegate;
 #[cfg(test)]
 mod finder_tests;
-mod delegate;
 mod list;
 mod outcome;
 mod positioned_preview;
@@ -16,7 +16,7 @@ use std::sync::Arc;
 use workspace::Workspace;
 
 pub use config::{
-    FinderConfig, MissingField, Outcome, ParsedConfig, Preview, Source, QUERY_PLACEHOLDER,
+    FinderConfig, MissingField, Outcome, ParsedConfig, Preview, QUERY_PLACEHOLDER, Source,
     WHOLE_ENTRY, fields, has_query_placeholder, parse_config, substitute, substitute_args,
     substitute_json, substitute_query,
 };
