@@ -1,19 +1,17 @@
 use crate::{
-    Open,
-    QUERY_DEBOUNCE,
+    Open, QUERY_DEBOUNCE,
     delegate::{FinderDelegate, FinderPicker},
     init_with_registry,
     registry::FinderRegistry,
     source::{
-        FLUSH_INTERVAL, SOURCE_TIMEOUT,
-        set_source_runner,
+        FLUSH_INTERVAL, SOURCE_TIMEOUT, set_source_runner,
         test_support::{ScriptedRunner, Step, emitting, exit_ok, exit_with},
     },
 };
 use editor::Editor;
 use gpui::{AppContext as _, Entity, TestAppContext, VisualTestContext};
 use multi_buffer::MultiBufferOffset;
-use picker::{Picker, PickerDelegate as _, PreviewSource};
+use picker::{Picker, PickerDelegate as _, PreviewSource, PreviewUpdate};
 use project::Project;
 use serde_json::json;
 use std::{
@@ -84,7 +82,8 @@ async fn setup_query<'a>(
     per_spawn: Vec<Vec<Step>>,
     cx: &'a mut TestAppContext,
 ) -> (Harness, &'a mut VisualTestContext) {
-    let (with_runner, cx) = setup_with_runner(config, ScriptedRunnerSpec::PerSpawn(per_spawn), cx).await;
+    let (with_runner, cx) =
+        setup_with_runner(config, ScriptedRunnerSpec::PerSpawn(per_spawn), cx).await;
     (with_runner.harness, cx)
 }
 
@@ -152,10 +151,13 @@ async fn setup_with_runner<'a>(
         cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
     let workspace = multi_workspace.read_with(cx, |multi, _| multi.workspace().clone());
 
-    (HarnessWithRunner {
-        harness: Harness { workspace },
-        runner: runner_handle,
-    }, cx)
+    (
+        HarnessWithRunner {
+            harness: Harness { workspace },
+            runner: runner_handle,
+        },
+        cx,
+    )
 }
 
 fn open_demo(cx: &mut VisualTestContext) {
@@ -594,7 +596,10 @@ async fn an_outcome_can_jump_to_a_row_and_column(cx: &mut TestAppContext) {
     // "one\ntwo\nthree\n": row 3, column 2 is the `h` at offset 9.
     let head = editor.update_in(cx, |editor, window, cx| {
         let snapshot = editor.snapshot(window, cx);
-        editor.selections.newest::<MultiBufferOffset>(&snapshot).head()
+        editor
+            .selections
+            .newest::<MultiBufferOffset>(&snapshot)
+            .head()
     });
     assert_eq!(head, MultiBufferOffset(9));
 }
@@ -628,10 +633,8 @@ async fn naming_a_missing_field_reports_instead_of_opening(cx: &mut TestAppConte
 fn preview_target(
     picker: &Entity<Picker<FinderDelegate>>,
     cx: &mut VisualTestContext,
-) -> Option<PreviewSource> {
-    picker.read_with(cx, |picker, cx| {
-        picker.delegate.preview_target(cx).map(|update| update.source)
-    })
+) -> Option<PreviewUpdate> {
+    picker.read_with(cx, |picker, cx| picker.delegate.preview_target(cx))
 }
 
 #[gpui::test]
@@ -653,11 +656,11 @@ async fn a_relative_entry_previews_the_file_under_the_working_directory(cx: &mut
     cx.run_until_parked();
 
     let picker = active_finder(&harness, cx).expect("finder open");
+    let Some(update) = preview_target(&picker, cx) else {
+        panic!("expected a preview");
+    };
     assert!(
-        matches!(
-            preview_target(&picker, cx),
-            Some(PreviewSource::Path(path)) if path == Path::new("/project/sub/c.rs")
-        ),
+        matches!(update.source, PreviewSource::Path(path) if path == Path::new("/project/sub/c.rs")),
         "expected the entry resolved against the project root"
     );
 }
@@ -672,7 +675,8 @@ async fn an_entry_that_is_not_a_file_previews_a_message(cx: &mut TestAppContext)
     cx.run_until_parked();
 
     let picker = active_finder(&harness, cx).expect("finder open");
-    let Some(PreviewSource::Message(message)) = preview_target(&picker, cx) else {
+    let Some(PreviewSource::Message(message)) = preview_target(&picker, cx).map(|u| u.source)
+    else {
         panic!("expected a message for a directory");
     };
     assert!(
@@ -683,7 +687,8 @@ async fn an_entry_that_is_not_a_file_previews_a_message(cx: &mut TestAppContext)
 
     cx.dispatch_action(menu::SelectNext);
     cx.run_until_parked();
-    let Some(PreviewSource::Message(message)) = preview_target(&picker, cx) else {
+    let Some(PreviewSource::Message(message)) = preview_target(&picker, cx).map(|u| u.source)
+    else {
         panic!("expected a message for a missing file");
     };
     assert!(
@@ -693,13 +698,19 @@ async fn an_entry_that_is_not_a_file_previews_a_message(cx: &mut TestAppContext)
     );
 }
 
-/// A query-driven Finder shows nothing while the Query is empty: the Source
-/// is suppressed, not run with an empty pattern.
+/// A live-grep Finder's preview resolves to the rg-matched file, and stashes
+/// its position for the preview backend to highlight after the buffer loads.
 #[gpui::test]
-async fn a_query_driven_finder_runs_nothing_until_the_user_types(cx: &mut TestAppContext) {
-    let (harness, cx) = setup_query(
-        QUERY_CONFIG,
-        vec![emitting(&["a.rs", "b.rs"])],
+async fn a_live_grep_entry_previews_the_matched_line(cx: &mut TestAppContext) {
+    let (harness, cx) = setup(
+        r#"
+        [finder.demo]
+        delimiter = ":"
+        source = { type = "command", command = "list" }
+        outcome = { type = "open_path_at_position", path = "{1}:{2}:{3}" }
+        preview = { type = "path" }
+        "#,
+        emitting(&["multi.rs:3:2:three"]),
         cx,
     )
     .await;
@@ -708,7 +719,38 @@ async fn a_query_driven_finder_runs_nothing_until_the_user_types(cx: &mut TestAp
     cx.run_until_parked();
 
     let picker = active_finder(&harness, cx).expect("finder open");
-    assert_eq!(entries(&picker, cx), Vec::<String>::new(), "nothing ran yet");
+    let update = preview_target(&picker, cx).expect("a preview");
+
+    // The delegate hands back a plain path; the resolved position rides in the
+    // pending slot the preview backend consumes.
+    assert!(
+        matches!(update.source, PreviewSource::Path(path) if path == Path::new("/project/multi.rs")),
+        "expected the rg file resolved against the project root"
+    );
+    let pending = picker.read_with(cx, |picker, _| {
+        picker.delegate.pending_position.lock().clone()
+    });
+    let pending = pending.expect("the rg position should be stashed for the preview backend");
+    assert_eq!(pending.path, Path::new("/project/multi.rs"));
+    assert_eq!(pending.row, Some(3));
+    assert_eq!(pending.column, Some(2));
+}
+
+/// A query-driven Finder shows nothing while the Query is empty: the Source
+/// is suppressed, not run with an empty pattern.
+#[gpui::test]
+async fn a_query_driven_finder_runs_nothing_until_the_user_types(cx: &mut TestAppContext) {
+    let (harness, cx) = setup_query(QUERY_CONFIG, vec![emitting(&["a.rs", "b.rs"])], cx).await;
+
+    open_demo(cx);
+    cx.run_until_parked();
+
+    let picker = active_finder(&harness, cx).expect("finder open");
+    assert_eq!(
+        entries(&picker, cx),
+        Vec::<String>::new(),
+        "nothing ran yet"
+    );
     assert_eq!(status(&picker, cx), None, "not running, not failed");
 }
 
@@ -716,19 +758,15 @@ async fn a_query_driven_finder_runs_nothing_until_the_user_types(cx: &mut TestAp
 /// Source's output is the result set — no client fuzzy re-match.
 #[gpui::test]
 async fn a_query_driven_source_owns_filtering(cx: &mut TestAppContext) {
-    let (harness, cx) = setup_query(
-        QUERY_CONFIG,
-        vec![emitting(&["a.rs", "b.rs"])],
-        cx,
-    )
-    .await;
+    let (harness, cx) = setup_query(QUERY_CONFIG, vec![emitting(&["a.rs", "b.rs"])], cx).await;
 
     open_demo(cx);
     cx.run_until_parked();
 
     cx.simulate_input("foo");
     // Advance past the debounce and let the run settle.
-    cx.executor().advance_clock(QUERY_DEBOUNCE + FLUSH_INTERVAL * 2);
+    cx.executor()
+        .advance_clock(QUERY_DEBOUNCE + FLUSH_INTERVAL * 2);
     cx.run_until_parked();
 
     let picker = active_finder(&harness, cx).expect("finder open");
@@ -741,10 +779,7 @@ async fn a_query_driven_source_owns_filtering(cx: &mut TestAppContext) {
 async fn a_new_query_clears_the_list_before_the_new_run_lands(cx: &mut TestAppContext) {
     let (harness, cx) = setup_query(
         QUERY_CONFIG,
-        vec![
-            emitting(&["a.rs", "b.rs"]),
-            emitting(&["c.rs"]),
-        ],
+        vec![emitting(&["a.rs", "b.rs"]), emitting(&["c.rs"])],
         cx,
     )
     .await;
@@ -753,7 +788,8 @@ async fn a_new_query_clears_the_list_before_the_new_run_lands(cx: &mut TestAppCo
     cx.run_until_parked();
 
     cx.simulate_input("foo");
-    cx.executor().advance_clock(QUERY_DEBOUNCE + FLUSH_INTERVAL * 2);
+    cx.executor()
+        .advance_clock(QUERY_DEBOUNCE + FLUSH_INTERVAL * 2);
     cx.run_until_parked();
     let picker = active_finder(&harness, cx).expect("finder open");
     assert_eq!(entries(&picker, cx), vec!["a.rs", "b.rs"]);
@@ -768,7 +804,8 @@ async fn a_new_query_clears_the_list_before_the_new_run_lands(cx: &mut TestAppCo
     );
 
     // Once the debounce elapses and the new run lands, its entries appear.
-    cx.executor().advance_clock(QUERY_DEBOUNCE + FLUSH_INTERVAL * 2);
+    cx.executor()
+        .advance_clock(QUERY_DEBOUNCE + FLUSH_INTERVAL * 2);
     cx.run_until_parked();
     assert_eq!(entries(&picker, cx), vec!["c.rs"]);
 }
@@ -776,18 +813,14 @@ async fn a_new_query_clears_the_list_before_the_new_run_lands(cx: &mut TestAppCo
 /// Emptying the Query suppresses the Source and clears the list.
 #[gpui::test]
 async fn emptying_the_query_suppresses_the_source(cx: &mut TestAppContext) {
-    let (harness, cx) = setup_query(
-        QUERY_CONFIG,
-        vec![emitting(&["a.rs", "b.rs"])],
-        cx,
-    )
-    .await;
+    let (harness, cx) = setup_query(QUERY_CONFIG, vec![emitting(&["a.rs", "b.rs"])], cx).await;
 
     open_demo(cx);
     cx.run_until_parked();
 
     cx.simulate_input("foo");
-    cx.executor().advance_clock(QUERY_DEBOUNCE + FLUSH_INTERVAL * 2);
+    cx.executor()
+        .advance_clock(QUERY_DEBOUNCE + FLUSH_INTERVAL * 2);
     cx.run_until_parked();
     let picker = active_finder(&harness, cx).expect("finder open");
     assert_eq!(entries(&picker, cx), vec!["a.rs", "b.rs"]);
@@ -796,7 +829,8 @@ async fn emptying_the_query_suppresses_the_source(cx: &mut TestAppContext) {
     picker.update_in(cx, |picker, window, cx| {
         picker.set_query("", window, cx);
     });
-    cx.executor().advance_clock(QUERY_DEBOUNCE + FLUSH_INTERVAL * 2);
+    cx.executor()
+        .advance_clock(QUERY_DEBOUNCE + FLUSH_INTERVAL * 2);
     cx.run_until_parked();
     assert_eq!(entries(&picker, cx), Vec::<String>::new());
     assert_eq!(status(&picker, cx), None);
@@ -826,13 +860,15 @@ async fn a_straggler_from_a_killed_run_is_ignored(cx: &mut TestAppContext) {
     cx.run_until_parked();
 
     cx.simulate_input("foo");
-    cx.executor().advance_clock(QUERY_DEBOUNCE + FLUSH_INTERVAL * 2);
+    cx.executor()
+        .advance_clock(QUERY_DEBOUNCE + FLUSH_INTERVAL * 2);
     cx.run_until_parked();
     let picker = active_finder(&harness, cx).expect("finder open");
     assert_eq!(entries(&picker, cx), vec!["stale.rs"]);
 
     cx.simulate_input("bar");
-    cx.executor().advance_clock(QUERY_DEBOUNCE + FLUSH_INTERVAL * 2);
+    cx.executor()
+        .advance_clock(QUERY_DEBOUNCE + FLUSH_INTERVAL * 2);
     cx.run_until_parked();
     assert_eq!(entries(&picker, cx), vec!["fresh.rs"]);
 
@@ -873,13 +909,15 @@ async fn an_enter_during_the_debounce_forces_the_spawn_and_confirms(cx: &mut Tes
 /// the process spawns.
 #[gpui::test]
 async fn the_query_is_substituted_into_the_spawned_args(cx: &mut TestAppContext) {
-    let (with_runner, cx) = setup_query_with_runner(QUERY_CONFIG, vec![emitting(&["a.rs"])], cx).await;
+    let (with_runner, cx) =
+        setup_query_with_runner(QUERY_CONFIG, vec![emitting(&["a.rs"])], cx).await;
 
     open_demo(cx);
     cx.run_until_parked();
 
     cx.simulate_input("foo");
-    cx.executor().advance_clock(QUERY_DEBOUNCE + FLUSH_INTERVAL * 2);
+    cx.executor()
+        .advance_clock(QUERY_DEBOUNCE + FLUSH_INTERVAL * 2);
     cx.run_until_parked();
 
     let spawned = with_runner.runner.spawned_args();

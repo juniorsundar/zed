@@ -90,10 +90,8 @@ fn open_path(
                 let exists = fs.metadata(&target.path).await.ok().flatten().is_some();
                 let open = workspace.update_in(cx, |workspace, window, cx| {
                     if !exists {
-                        workspace.show_error(
-                            format!("{} no longer exists", target.path.display()),
-                            cx,
-                        );
+                        workspace
+                            .show_error(format!("{} no longer exists", target.path.display()), cx);
                         return None;
                     }
                     Some(workspace.open_abs_path(

@@ -373,7 +373,10 @@ pub(crate) mod test_support {
                 return Err(std::io::Error::other(reason.clone()));
             }
 
-            self.spawned_args.lock().expect("unpoisoned").push(args.to_vec());
+            self.spawned_args
+                .lock()
+                .expect("unpoisoned")
+                .push(args.to_vec());
 
             let steps = {
                 let mut queue = self.per_spawn.lock().expect("unpoisoned");
@@ -428,7 +431,10 @@ mod tests {
     }
 
     /// Drives a Source to completion, returning every update it produced.
-    async fn collect(runner: impl SourceRunner + 'static, cx: &mut TestAppContext) -> Vec<SourceUpdate> {
+    async fn collect(
+        runner: impl SourceRunner + 'static,
+        cx: &mut TestAppContext,
+    ) -> Vec<SourceUpdate> {
         let executor = cx.executor();
         let (sender, receiver) = mpsc::unbounded();
         let Source::Command { command, args } = source() else {
@@ -473,7 +479,10 @@ mod tests {
         )
         .await;
 
-        assert_eq!(entries(&updates), vec!["main", "feature/one", "feature/two"]);
+        assert_eq!(
+            entries(&updates),
+            vec!["main", "feature/one", "feature/two"]
+        );
         assert_eq!(
             updates.last(),
             Some(&SourceUpdate::Finished { truncated: false })

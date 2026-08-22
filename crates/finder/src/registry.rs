@@ -117,15 +117,14 @@ impl FinderRegistry {
 
     /// Every Finder and every failed Finder, for the Finder list.
     pub fn entries(&self) -> Vec<FinderListEntry> {
-        let finders = self
-            .finders
-            .values()
-            .cloned()
-            .map(FinderListEntry::Finder);
-        let broken = self.errors.iter().map(|(name, error)| FinderListEntry::Broken {
-            name: name.clone(),
-            error: error.clone(),
-        });
+        let finders = self.finders.values().cloned().map(FinderListEntry::Finder);
+        let broken = self
+            .errors
+            .iter()
+            .map(|(name, error)| FinderListEntry::Broken {
+                name: name.clone(),
+                error: error.clone(),
+            });
         finders.chain(broken).collect()
     }
 
@@ -191,7 +190,10 @@ mod tests {
         let (_fs, registry) = registry_over(ONE_FINDER, cx).await;
 
         registry.read_with(cx, |registry, _| {
-            assert!(matches!(registry.lookup("nonexistent"), FinderLookup::Missing));
+            assert!(matches!(
+                registry.lookup("nonexistent"),
+                FinderLookup::Missing
+            ));
         });
     }
 
@@ -234,7 +236,10 @@ mod tests {
 
         registry.read_with(cx, |registry, _| {
             assert!(matches!(registry.lookup("good"), FinderLookup::Found(_)));
-            assert!(matches!(registry.lookup("bad"), FinderLookup::Broken { .. }));
+            assert!(matches!(
+                registry.lookup("bad"),
+                FinderLookup::Broken { .. }
+            ));
             assert_eq!(registry.entries().len(), 2);
         });
     }
