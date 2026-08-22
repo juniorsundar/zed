@@ -3,19 +3,17 @@ use gpui::SharedString;
 use serde::Deserialize;
 use std::{collections::BTreeMap, sync::Arc};
 
-/// Where a Finder's Entries come from.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Source {
-    /// Runs once at open; the Query filters its Entries client-side.
+    /// Runs once at open; the Query filters its output client-side.
     Command {
         command: String,
         #[serde(default)]
         args: Vec<String>,
     },
-    /// Re-runs per Query with [`QUERY_PLACEHOLDER`] substituted into `args`;
-    /// its output is the result set. Rejected at parse time if no arg carries
-    /// the placeholder, since the Query would be silently dropped.
+    /// Re-runs per Query with [`QUERY_PLACEHOLDER`] substituted into `args`.
+    /// Rejected at parse time if no arg carries the placeholder.
     Query {
         command: String,
         #[serde(default)]
@@ -36,7 +34,6 @@ impl Source {
         }
     }
 
-    /// Whether the Source re-runs per Query.
     pub fn is_query_driven(&self) -> bool {
         matches!(self, Source::Query { .. })
     }
@@ -44,20 +41,17 @@ impl Source {
 
 pub const QUERY_PLACEHOLDER: &str = "{query}";
 
-/// Replaces every [`QUERY_PLACEHOLDER`] in `args` with `query`. Unlike
-/// [`substitute`], there are no Field semantics to validate.
+/// Replaces every [`QUERY_PLACEHOLDER`] in `args` with `query`.
 pub fn substitute_query(args: &[String], query: &str) -> Vec<String> {
     args.iter()
         .map(|arg| arg.replace(QUERY_PLACEHOLDER, query))
         .collect()
 }
 
-/// Whether any of `args` carries the Query placeholder.
 pub fn has_query_placeholder(args: &[String]) -> bool {
     args.iter().any(|arg| arg.contains(QUERY_PLACEHOLDER))
 }
 
-/// What happens when an Entry is chosen.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Outcome {
@@ -66,8 +60,8 @@ pub enum Outcome {
         #[serde(default)]
         path: Option<String>,
     },
-    /// Like [`OpenPath`](Outcome::OpenPath), but the path carries a trailing
-    /// `:row:col` and the editor jumps there.
+    /// Like [`Outcome::OpenPath`], but the path carries a trailing `:row:col`
+    /// and the editor jumps there.
     OpenPathAtPosition {
         #[serde(default)]
         path: Option<String>,
@@ -95,8 +89,6 @@ impl Outcome {
     }
 }
 
-/// What the Preview pane shows. Tagged so a command-driven Preview can be
-/// added without breaking configs.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Preview {
@@ -134,17 +126,15 @@ struct ConfigFile {
     finder: BTreeMap<String, toml::Value>,
 }
 
-/// Finders that failed to deserialize are kept as errors rather than dropped,
-/// so opening one by name can report why it is unusable.
+/// Failed finders stay addressable so opening them can report why.
 #[derive(Debug, Default)]
 pub struct ParsedConfig {
     pub finders: BTreeMap<SharedString, Arc<FinderConfig>>,
     pub errors: BTreeMap<SharedString, SharedString>,
 }
 
-/// Returns `Err` only when the file is not valid TOML at all; a single
-/// malformed Finder lands in [`ParsedConfig::errors`] so its siblings keep
-/// working.
+/// Returns `Err` only when the file is not valid TOML at all; individual
+/// malformed finders land in [`ParsedConfig::errors`].
 pub fn parse_config(contents: &str) -> Result<ParsedConfig> {
     let file: ConfigFile = toml::from_str(contents).context("parsing finder config")?;
 
@@ -198,9 +188,8 @@ impl FinderBody {
 
 pub const WHOLE_ENTRY: &str = "{}";
 
-/// Why a template could not be applied to an Entry. Reported rather than
-/// substituted empty: silently opening `""` or dispatching a blank argument is
-/// a mistake the user cannot see.
+/// A template referenced a Field the Entry does not have. Reported rather
+/// than substituted empty so the mistake is visible.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MissingField {
     pub index: usize,
@@ -218,8 +207,8 @@ impl std::fmt::Display for MissingField {
     }
 }
 
-/// Divides an Entry into Fields. With no delimiter, runs of whitespace
-/// separate them, which is what column output like `docker ps` produces.
+/// With no delimiter, runs of whitespace separate Fields (column output
+/// like `docker ps`).
 pub fn fields<'a>(entry: &'a str, delimiter: Option<&str>) -> Vec<&'a str> {
     match delimiter {
         Some(delimiter) if !delimiter.is_empty() => entry.split(delimiter).collect(),
@@ -264,7 +253,6 @@ pub fn substitute(
             })?;
             result.push_str(field);
         } else {
-            // Not a placeholder we understand; leave it as written.
             result.push('{');
             result.push_str(placeholder);
             result.push('}');
@@ -277,7 +265,6 @@ pub fn substitute(
     Ok(result)
 }
 
-/// Applies [`substitute`] to every argument.
 pub fn substitute_args(
     args: &[String],
     entry: &str,
@@ -288,7 +275,6 @@ pub fn substitute_args(
         .collect()
 }
 
-/// Applies [`substitute`] to every string leaf of `value`.
 pub fn substitute_json(
     value: &serde_json::Value,
     entry: &str,
@@ -659,8 +645,6 @@ mod tests {
         );
     }
 
-    /// Braces that are not placeholders belong to the user's text — a stash
-    /// name like `stash@{0}` must survive untouched.
     #[test]
     fn unrecognised_braces_are_left_alone() {
         assert_eq!(

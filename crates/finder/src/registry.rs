@@ -7,17 +7,14 @@ use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
 pub const CONFIG_FILE_NAME: &str = "finders.toml";
 
-/// What a Finder name resolves to.
-///
-/// A Finder that failed to parse stays addressable so that opening it can
-/// report the parse failure rather than claiming it does not exist.
+/// A Finder that failed to parse stays addressable so opening it can report
+/// the failure rather than claiming it does not exist.
 pub enum FinderLookup {
     Found(Arc<FinderConfig>),
     Broken { error: SharedString },
     Missing,
 }
 
-/// One row of the Finder list.
 pub enum FinderListEntry {
     Finder(Arc<FinderConfig>),
     Broken {
@@ -128,7 +125,7 @@ impl FinderRegistry {
         finders.chain(broken).collect()
     }
 
-    /// Set when the config file as a whole could not be read as TOML.
+    /// Set when the config file could not be read as TOML at all.
     pub fn file_error(&self) -> Option<&SharedString> {
         self.file_error.as_ref()
     }

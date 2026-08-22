@@ -5,8 +5,6 @@ use std::path::{Path, PathBuf};
 use util::{ResultExt as _, paths::PathWithPosition};
 use workspace::{OpenOptions, Workspace};
 
-/// An Entry that is already absolute is used as-is; anything else is resolved
-/// against the directory the Source ran in.
 pub fn resolve_entry_path(entry: &str, cwd: &Path) -> PathBuf {
     let path = Path::new(entry);
     if path.is_absolute() {
@@ -16,8 +14,6 @@ pub fn resolve_entry_path(entry: &str, cwd: &Path) -> PathBuf {
     }
 }
 
-/// The absolute path an Outcome would open, and where in it to land.
-///
 /// The Preview resolves the selected Entry the same way, so what it shows is
 /// what Confirm will open.
 pub fn resolve_outcome_path(
@@ -119,8 +115,8 @@ fn open_path(
                             return;
                         };
                         let snapshot = buffer.read(cx).snapshot();
-                        // Rows and columns are 1-based everywhere a tool prints
-                        // them; buffer points are 0-based.
+                        // Rows and columns are 1-based in tool output;
+                        // buffer points are 0-based.
                         let point = snapshot.point_from_external_input(
                             row.saturating_sub(1),
                             target.column.unwrap_or(1).saturating_sub(1),
@@ -174,7 +170,7 @@ mod tests {
         assert_eq!(resolved.row, None);
     }
 
-    /// `git status --porcelain` puts the path in the second field.
+    /// `git status --porcelain` puts the path in the second Field.
     #[test]
     fn open_path_can_name_a_field() {
         let resolved = resolve(
@@ -187,8 +183,7 @@ mod tests {
         assert_eq!(resolved.path, PathBuf::from("/project/src/main.rs"));
     }
 
-    /// The position is parsed from the right, so a path may contain the
-    /// delimiter without being mangled.
+    /// Parsed from the right, so a path may contain the delimiter.
     #[test]
     fn open_path_at_position_reads_a_trailing_row_and_column() {
         let resolved = resolve(
@@ -201,9 +196,8 @@ mod tests {
         assert_eq!(resolved.column, Some(3));
     }
 
-    /// A ripgrep line is the path, the position, and the matched text. Only the
-    /// first three fields are the target, and the text may itself contain the
-    /// delimiter.
+    /// A ripgrep line: only the first three Fields are the target; the text
+    /// may itself contain the delimiter.
     #[test]
     fn a_ripgrep_line_resolves_to_its_file_and_position() {
         let resolved = resolve(

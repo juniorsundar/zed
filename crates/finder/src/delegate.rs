@@ -69,9 +69,8 @@ impl FinderPicker {
 
 impl Render for FinderPicker {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        // No width here: the Picker sizes itself, and grows to its larger
-        // "telescope" shape when a Preview is showing. Constraining it leaves
-        // the results pane with nothing to draw in.
+        // No width: the Picker sizes itself, growing to its larger
+        // "telescope" shape when a Preview is showing.
         v_flex().child(self.picker.clone())
     }
 }
@@ -102,18 +101,12 @@ fn message_preview(subject: &str, reason: Option<&str>, cx: &App) -> PreviewUpda
 }
 
 /// How long after the user stops typing before a query-driven Source is
-/// re-spawned. Short enough to feel live, long enough to coalesce a burst of
-/// keystrokes into one spawn rather than one per character.
+/// re-spawned.
 pub const QUERY_DEBOUNCE: Duration = Duration::from_millis(150);
 
-/// Identifies which run of a query-driven Source a batch of Entries belongs
-/// to. When a new Query spawns a new run, the generation is bumped; a straggler
-/// batch from the killed run carries a stale generation and is dropped so it
-/// cannot pollute the new run's list.
+/// Bumped per run; batches carrying a stale generation are dropped.
 type Generation = u64;
 
-/// How far the Source has got. Entries can arrive before any of these settle,
-/// and can outlive a failure, so this is not a state machine over the list.
 #[derive(Default)]
 struct SourceState {
     running: bool,
@@ -131,23 +124,16 @@ pub struct FinderDelegate {
     matches: Vec<StringMatch>,
     selected_index: usize,
     state: SourceState,
-    /// Set when Entries arrive rather than the user typing, so the selection
-    /// does not jump out from under them.
     keep_selected_entry: bool,
     source_task: Task<()>,
-    /// Present only for a [`Source::Query`].
     query: Option<QueryState>,
     pub(crate) pending_position: PendingPosition,
 }
 
-/// The query-driven half of the delegate.
 #[derive(Default)]
 struct QueryState {
-    /// Bumped per run; batches carrying an older generation are ignored.
     generation: Generation,
-    /// The Query the current run was spawned for.
     pending_query: Option<String>,
-    /// Wakes a pending debounce early (Enter forces the spawn).
     force_wake: Option<futures::channel::mpsc::UnboundedSender<()>>,
 }
 
@@ -181,8 +167,6 @@ impl FinderDelegate {
         }
     }
 
-    /// Runs the Source, appending Entries as they arrive. The picker is already
-    /// on screen before the first batch lands.
     fn spawn_source(
         &self,
         project: Entity<Project>,
@@ -212,8 +196,8 @@ impl FinderDelegate {
             };
 
             let (sender, mut updates) = mpsc::unbounded();
-            // Dropping this task drops the Source's stream, which kills the
-            // child process; that happens when the picker itself is dropped.
+            // Dropping this task kills the child process; it happens when the
+            // picker is dropped.
             let _source = cx.background_spawn(run_source(
                 runner,
                 command,
@@ -237,18 +221,15 @@ impl FinderDelegate {
         })
     }
 
-    /// Debounces the Query, then spawns one run of the Source for it. The run
-    /// is tagged with the current generation; batches from a superseded run
-    /// are dropped by [`apply_query`]. The picker awaits the returned Task to
-    /// refresh the preview; dropping it (a new Query) cancels the debounce and
-    /// kills the child.
+    /// Debounces the Query, then spawns one run of the Source for it, tagged
+    /// with the current generation. Dropping the returned Task cancels the
+    /// debounce and kills the child.
     fn update_query_matches(
         &mut self,
         query: String,
         window: &mut Window,
         cx: &mut Context<Picker<Self>>,
     ) -> Task<()> {
-        // Empty Query: nothing runs until there is something to search for.
         if query.is_empty() {
             self.entries = Arc::new(Vec::new());
             self.matches.clear();
@@ -304,8 +285,7 @@ impl FinderDelegate {
             futures::pin_mut!(timer);
             let woke = futures::future::select(timer, force_rx.next()).await;
             let _ = woke;
-            // A newer Query replaced this task in `pending_update_matches`, so
-            // it was dropped and cancelled us; bail if we are stale anyway.
+            // A newer Query replaced this task and cancelled us; bail anyway.
             let superseded = picker
                 .read_with(cx, |picker, _| {
                     picker
@@ -326,7 +306,7 @@ impl FinderDelegate {
             };
 
             let (sender, mut updates) = mpsc::unbounded();
-            // Dropping the task drops the stream, killing the child.
+            // Dropping the task kills the child.
             let _source = cx.background_spawn(run_source(
                 runner,
                 command,
@@ -349,8 +329,7 @@ impl FinderDelegate {
         })
     }
 
-    /// Drops batches from a superseded run. The Source owns filtering, so
-    /// Entries become Matches directly.
+    /// Drops batches from a superseded run; the Source owns filtering.
     fn apply_query(&mut self, generation: Generation, update: SourceUpdate) {
         let query_state = self.query.as_mut().expect("query-driven only");
         if generation != query_state.generation {
@@ -364,7 +343,7 @@ impl FinderDelegate {
                 ));
                 self.matches
                     .extend(entries.into_iter().map(|entry| StringMatch {
-                        // Unused for rendering; query-driven matches have no highlights.
+                        // Unused for rendering; no highlights on query matches.
                         candidate_id: 0,
                         score: 0.,
                         positions: Vec::new(),
@@ -405,8 +384,8 @@ impl FinderDelegate {
         self.keep_selected_entry = true;
     }
 
-    /// A message about the Source that the list itself cannot carry: a failure
-    /// that arrived after usable Entries did, or a Source cut short at the cap.
+    /// A failure that arrived after usable Entries, or a Source cut short at
+    /// the cap: things the list itself cannot carry.
     fn footer_message(&self) -> Option<SharedString> {
         if !self.entries.is_empty()
             && let Some(failure) = &self.state.failure
@@ -440,8 +419,8 @@ impl PickerDelegate for FinderDelegate {
         self.config.placeholder.as_ref().into()
     }
 
-    /// Doubles as the Source's status line: the picker opens before the Source
-    /// has produced anything, so an empty list must say why.
+    /// Doubles as the Source's status line: the picker opens before the
+    /// Source has produced anything, so an empty list must say why.
     fn no_matches_text(&self, _window: &mut Window, _cx: &mut App) -> Option<SharedString> {
         Some(self.status_message().unwrap_or_else(|| "No matches".into()))
     }

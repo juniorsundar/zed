@@ -11,24 +11,20 @@ use gpui::{BackgroundExecutor, SharedString};
 use std::{fmt, path::Path, pin::Pin, sync::Arc, time::Duration};
 use util::command::Stdio;
 
-/// How long a Source may produce nothing at all before it is abandoned. Once it
-/// has produced something it is never abandoned for slowness: a Source that
-/// walks a large tree may legitimately take far longer than this to finish.
+/// How long a Source may produce nothing before it is abandoned. Once it has
+/// produced something it is never abandoned for slowness.
 pub const SOURCE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The most Entries a Source may produce. Beyond this the Source is dropped and
-/// what has arrived so far is kept.
+/// The most Entries a Source may produce; beyond this the Source is dropped.
 pub const MAX_ENTRIES: usize = 100_000;
 
-/// How long arriving Entries are accumulated before being handed on. Without
-/// this a fast Source would trigger a re-match per line.
+/// Entries are accumulated for this long before being handed on, so a fast
+/// Source does not trigger a re-match per line.
 pub const FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 
-/// One thing a running Source has to say.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SourceEvent {
     Line(String),
-    /// The process ended. Always the last event.
     Exited {
         /// `None` when the process was terminated by a signal.
         code: Option<i32>,
@@ -38,8 +34,8 @@ pub enum SourceEvent {
 
 pub type SourceStream = Pin<Box<dyn Stream<Item = SourceEvent> + Send>>;
 
-/// The seam between a Source declaration and a real process. Kept below
-/// [`run_source`]'s timeout, cap, and flush policy so those stay under test.
+/// The seam between a Source declaration and a real process, so the timeout,
+/// cap, and flush policy in [`run_source`] stay under test.
 #[async_trait]
 pub trait SourceRunner: Send + Sync {
     async fn spawn(
@@ -57,7 +53,6 @@ struct GlobalSourceRunner(Arc<dyn SourceRunner>);
 
 impl gpui::Global for GlobalSourceRunner {}
 
-/// Replaces the runner every Finder uses. Tests install a fake here.
 pub fn set_source_runner(runner: Arc<dyn SourceRunner>, cx: &mut gpui::App) {
     cx.set_global(GlobalSourceRunner(runner));
 }
@@ -107,8 +102,8 @@ impl SourceRunner for DefaultSourceRunner {
                         Some(Ok(line)) => {
                             return Some((SourceEvent::Line(line), Some((lines, child, stderr))));
                         }
-                        // A line that is not UTF-8 says nothing about the rest
-                        // of the stream, so skip it rather than ending early.
+                        // Not UTF-8 says nothing about the rest of the stream;
+                        // skip rather than end early.
                         Some(Err(_)) => continue,
                         None => break,
                     }
@@ -129,7 +124,6 @@ impl SourceRunner for DefaultSourceRunner {
     }
 }
 
-/// Why a Source stopped producing Entries. Rendered into the picker.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SourceFailure {
     CouldNotSpawn { command: String, reason: String },
@@ -155,8 +149,6 @@ impl fmt::Display for SourceFailure {
     }
 }
 
-/// A batch of Entries, or the reason there will be no more. Exactly one
-/// terminal update is sent, and it is sent last.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SourceUpdate {
     Entries(Vec<SharedString>),
@@ -286,11 +278,9 @@ fn exit_details(code: Option<i32>, stderr: &str) -> String {
 pub(crate) mod test_support {
     use super::*;
 
-    /// One instruction in a scripted Source.
     #[derive(Debug, Clone)]
     pub enum Step {
         Line(&'static str),
-        /// Wait before producing the next event.
         Wait(Duration),
         Exit {
             code: Option<i32>,
@@ -312,7 +302,7 @@ pub(crate) mod test_support {
         }
     }
 
-    /// Yields `lines` and then exits cleanly, all without delay.
+    /// Yields `lines` and then exits cleanly, without delay.
     pub fn emitting(lines: &[&'static str]) -> Vec<Step> {
         lines
             .iter()
@@ -322,7 +312,6 @@ pub(crate) mod test_support {
     }
 
     pub struct ScriptedRunner {
-        /// One entry per `spawn` call; extras get `tail`.
         per_spawn: std::sync::Mutex<Vec<Vec<Step>>>,
         spawn_error: Option<String>,
         executor: BackgroundExecutor,
@@ -430,7 +419,6 @@ mod tests {
         }
     }
 
-    /// Drives a Source to completion, returning every update it produced.
     async fn collect(
         runner: impl SourceRunner + 'static,
         cx: &mut TestAppContext,
@@ -524,8 +512,6 @@ mod tests {
         );
     }
 
-    /// A Source may produce usable Entries and only then fail. Those Entries
-    /// are still worth showing, so they are delivered before the failure.
     #[gpui::test]
     async fn keeps_entries_produced_before_a_failure(cx: &mut TestAppContext) {
         let updates = collect(
@@ -567,8 +553,6 @@ mod tests {
         );
     }
 
-    /// The timeout guards the first Entry only. A Source that keeps producing
-    /// is never abandoned for taking a long time overall.
     #[gpui::test]
     async fn does_not_abandon_a_slow_source_that_is_still_producing(cx: &mut TestAppContext) {
         let updates = collect(
@@ -592,8 +576,6 @@ mod tests {
         );
     }
 
-    /// Entries arriving over time reach the consumer in more than one batch,
-    /// rather than all at the end.
     #[gpui::test]
     async fn delivers_entries_in_batches_as_they_arrive(cx: &mut TestAppContext) {
         let updates = collect(
