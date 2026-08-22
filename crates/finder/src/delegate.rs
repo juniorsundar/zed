@@ -1,6 +1,7 @@
 use crate::{
     config::{FinderConfig, Preview, Source, substitute_query},
     outcome::{apply_outcome, resolve_outcome_path},
+    positioned_preview::{PendingPosition, new_pending_position, positioned_editor_preview},
     source::{MAX_ENTRIES, SourceUpdate, run_source, source_runner},
 };
 use collections::HashMap;
@@ -34,16 +35,19 @@ impl FinderPicker {
     ) -> Self {
         let previewed = config.preview.is_some();
         let is_query_driven = config.source.is_query_driven();
+        let pending_position = new_pending_position();
         let delegate = FinderDelegate::new(
             cx.entity().downgrade(),
             workspace,
             config,
             cwd,
             project.clone(),
+            pending_position.clone(),
         );
         let picker = cx.new(|cx| {
             let mut picker = if previewed {
-                let preview = picker_preview::editor_preview(project.clone(), window, cx);
+                let preview =
+                    positioned_editor_preview(project.clone(), pending_position, window, cx);
                 Picker::uniform_list_with_preview(delegate, preview, window, cx)
             } else {
                 Picker::uniform_list(delegate, window, cx)
@@ -134,6 +138,7 @@ pub struct FinderDelegate {
     source_task: Task<()>,
     /// Present only for a [`Source::Query`].
     query: Option<QueryState>,
+    pending_position: PendingPosition,
 }
 
 /// The query-driven half of the delegate.
@@ -154,6 +159,7 @@ impl FinderDelegate {
         config: Arc<FinderConfig>,
         cwd: Arc<Path>,
         project: Entity<Project>,
+        pending_position: PendingPosition,
     ) -> Self {
         let is_query_driven = config.source.is_query_driven();
         Self {
@@ -172,6 +178,7 @@ impl FinderDelegate {
             keep_selected_entry: false,
             source_task: Task::ready(()),
             query: is_query_driven.then(QueryState::default),
+            pending_position,
         }
     }
 
@@ -574,6 +581,7 @@ impl PickerDelegate for FinderDelegate {
     }
 
     fn try_get_preview_data_for_match(&self, cx: &App) -> Option<PreviewUpdate> {
+        self.pending_position.lock().take();
         let Some(Preview::Path) = self.config.preview else {
             return None;
         };
@@ -586,10 +594,11 @@ impl PickerDelegate for FinderDelegate {
             &self.cwd,
             self.config.delimiter.as_deref(),
         )?;
-        let path = match resolved {
-            Ok(target) => target.path,
+        let target = match resolved {
+            Ok(target) => target,
             Err(error) => return Some(message_preview(&error, None, cx)),
         };
+        let path = target.path.clone();
 
         // Only a path inside the project can be classified here, because this
         // runs synchronously and the filesystem cannot be consulted. A path
@@ -606,6 +615,9 @@ impl PickerDelegate for FinderDelegate {
             }
         }
 
+        if target.row.is_some() {
+            *self.pending_position.lock() = Some(target);
+        }
         Some(PreviewUpdate::from_path(path))
     }
 
