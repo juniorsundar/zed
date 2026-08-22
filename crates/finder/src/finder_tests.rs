@@ -22,7 +22,6 @@ use workspace::{AppState, MultiWorkspace, Workspace};
 
 const CONFIG_PATH: &str = "/config/finders.toml";
 
-/// A Finder whose Outcome opens the Entry as a path.
 const OPEN_PATH_CONFIG: &str = r#"
     [finder.demo]
     label = "Demo"
@@ -30,7 +29,6 @@ const OPEN_PATH_CONFIG: &str = r#"
     outcome = { type = "open_path" }
 "#;
 
-/// The same Finder, with a Preview.
 const PREVIEW_CONFIG: &str = r#"
     [finder.demo]
     label = "Demo"
@@ -39,8 +37,6 @@ const PREVIEW_CONFIG: &str = r#"
     preview = { type = "path" }
 "#;
 
-/// A query-driven Finder: the typed Query is substituted into `args` and the
-/// command re-runs per Query. Its output is the result set.
 const QUERY_CONFIG: &str = r#"
     [finder.demo]
     label = "Demo"
@@ -75,8 +71,6 @@ async fn setup<'a>(
     (with_runner.harness, cx)
 }
 
-/// Sets up a query-driven Finder whose runner answers each `spawn` with the
-/// next entry in `per_spawn`, in order.
 async fn setup_query<'a>(
     config: &'static str,
     per_spawn: Vec<Vec<Step>>,
@@ -87,8 +81,6 @@ async fn setup_query<'a>(
     (with_runner.harness, cx)
 }
 
-/// Like [`setup_query`] but also returns the installed runner, so a test can
-/// inspect the args each spawn received.
 async fn setup_query_with_runner<'a>(
     config: &'static str,
     per_spawn: Vec<Vec<Step>>,
@@ -239,8 +231,6 @@ async fn populates_entries_once_the_source_finishes(cx: &mut TestAppContext) {
     assert_eq!(footer(&picker, cx), None);
 }
 
-/// Entries appear while the Source is still running, rather than only at the
-/// end. The picker is usable throughout.
 #[gpui::test]
 async fn shows_entries_while_the_source_is_still_running(cx: &mut TestAppContext) {
     let (harness, cx) = setup(
@@ -273,8 +263,6 @@ async fn shows_entries_while_the_source_is_still_running(cx: &mut TestAppContext
     assert_eq!(status(&picker, cx), None);
 }
 
-/// A Source that keeps producing is never abandoned for slowness, even when the
-/// gaps between Entries exceed the timeout that guards its first output.
 #[gpui::test]
 async fn a_slow_but_productive_source_is_not_abandoned(cx: &mut TestAppContext) {
     let (harness, cx) = setup(
@@ -298,8 +286,7 @@ async fn a_slow_but_productive_source_is_not_abandoned(cx: &mut TestAppContext) 
     assert_eq!(footer(&picker, cx), None);
 }
 
-/// The selection is anchored to the Entry, not the index: Entries arriving
-/// underneath must not drag the highlight back to the top of the list.
+/// The selection is anchored to the Entry, not the index.
 #[gpui::test]
 async fn arriving_entries_do_not_move_the_selection(cx: &mut TestAppContext) {
     let (harness, cx) = setup(
@@ -335,7 +322,6 @@ async fn arriving_entries_do_not_move_the_selection(cx: &mut TestAppContext) {
     );
 }
 
-/// Typing is the one thing that *should* reset the selection.
 #[gpui::test]
 async fn typing_a_query_resets_the_selection(cx: &mut TestAppContext) {
     let (harness, cx) = setup(OPEN_PATH_CONFIG, emitting(&["a.rs", "b.rs"]), cx).await;
@@ -398,8 +384,6 @@ async fn a_failing_source_explains_itself_in_the_empty_state(cx: &mut TestAppCon
     );
 }
 
-/// A Source that fails partway keeps the Entries it already produced; the
-/// failure moves to the footer rather than replacing them.
 #[gpui::test]
 async fn a_late_failure_keeps_the_entries_and_moves_to_the_footer(cx: &mut TestAppContext) {
     let (harness, cx) = setup(
@@ -535,7 +519,7 @@ async fn confirming_a_dispatch_action_outcome_substitutes_the_entry(cx: &mut Tes
     assert!(active_finder(&harness, cx).is_none(), "the modal dismissed");
 }
 
-/// `git status --porcelain` shape: the path is the second Field.
+/// The path is the second Field (`git status --porcelain` shape).
 #[gpui::test]
 async fn an_outcome_opens_the_path_named_by_a_field(cx: &mut TestAppContext) {
     let (harness, cx) = setup(
@@ -563,8 +547,6 @@ async fn an_outcome_opens_the_path_named_by_a_field(cx: &mut TestAppContext) {
     assert_eq!(opened.as_deref(), Some("a.rs"));
 }
 
-/// A ripgrep-shaped Entry: the trailing `:row:col` moves the cursor, and the
-/// matched text after it is ignored.
 #[gpui::test]
 async fn an_outcome_can_jump_to_a_row_and_column(cx: &mut TestAppContext) {
     let (harness, cx) = setup(
@@ -604,8 +586,6 @@ async fn an_outcome_can_jump_to_a_row_and_column(cx: &mut TestAppContext) {
     assert_eq!(head, MultiBufferOffset(9));
 }
 
-/// A Finder that names a Field its Entries do not have reports the mistake
-/// rather than opening something empty.
 #[gpui::test]
 async fn naming_a_missing_field_reports_instead_of_opening(cx: &mut TestAppContext) {
     let (harness, cx) = setup(
@@ -665,8 +645,6 @@ async fn a_relative_entry_previews_the_file_under_the_working_directory(cx: &mut
     );
 }
 
-/// An Entry naming something that is not a previewable file must say so, rather
-/// than leaving the previously previewed file on screen.
 #[gpui::test]
 async fn an_entry_that_is_not_a_file_previews_a_message(cx: &mut TestAppContext) {
     let (harness, cx) = setup(PREVIEW_CONFIG, emitting(&["sub", "gone.rs"]), cx).await;
@@ -698,8 +676,6 @@ async fn an_entry_that_is_not_a_file_previews_a_message(cx: &mut TestAppContext)
     );
 }
 
-/// A live-grep Finder's preview resolves to the rg-matched file, and stashes
-/// its position for the preview backend to highlight after the buffer loads.
 #[gpui::test]
 async fn a_live_grep_entry_previews_the_matched_line(cx: &mut TestAppContext) {
     let (harness, cx) = setup(
@@ -721,8 +697,6 @@ async fn a_live_grep_entry_previews_the_matched_line(cx: &mut TestAppContext) {
     let picker = active_finder(&harness, cx).expect("finder open");
     let update = preview_target(&picker, cx).expect("a preview");
 
-    // The delegate hands back a plain path; the resolved position rides in the
-    // pending slot the preview backend consumes.
     assert!(
         matches!(update.source, PreviewSource::Path(path) if path == Path::new("/project/multi.rs")),
         "expected the rg file resolved against the project root"
@@ -736,8 +710,6 @@ async fn a_live_grep_entry_previews_the_matched_line(cx: &mut TestAppContext) {
     assert_eq!(pending.column, Some(2));
 }
 
-/// A query-driven Finder shows nothing while the Query is empty: the Source
-/// is suppressed, not run with an empty pattern.
 #[gpui::test]
 async fn a_query_driven_finder_runs_nothing_until_the_user_types(cx: &mut TestAppContext) {
     let (harness, cx) = setup_query(QUERY_CONFIG, vec![emitting(&["a.rs", "b.rs"])], cx).await;
@@ -754,8 +726,6 @@ async fn a_query_driven_finder_runs_nothing_until_the_user_types(cx: &mut TestAp
     assert_eq!(status(&picker, cx), None, "not running, not failed");
 }
 
-/// Typing a Query spawns the Source with the Query substituted in, and the
-/// Source's output is the result set — no client fuzzy re-match.
 #[gpui::test]
 async fn a_query_driven_source_owns_filtering(cx: &mut TestAppContext) {
     let (harness, cx) = setup_query(QUERY_CONFIG, vec![emitting(&["a.rs", "b.rs"])], cx).await;
@@ -773,8 +743,6 @@ async fn a_query_driven_source_owns_filtering(cx: &mut TestAppContext) {
     assert_eq!(entries(&picker, cx), vec!["a.rs", "b.rs"]);
 }
 
-/// A new Query clears the list first; it never shows answers to the previous
-/// Query while the new run is in flight.
 #[gpui::test]
 async fn a_new_query_clears_the_list_before_the_new_run_lands(cx: &mut TestAppContext) {
     let (harness, cx) = setup_query(
@@ -794,8 +762,7 @@ async fn a_new_query_clears_the_list_before_the_new_run_lands(cx: &mut TestAppCo
     let picker = active_finder(&harness, cx).expect("finder open");
     assert_eq!(entries(&picker, cx), vec!["a.rs", "b.rs"]);
 
-    // A new Query clears the list synchronously, before the debounce elapses
-    // and before the new run has produced anything.
+    // The list clears synchronously, before the debounce elapses.
     cx.simulate_input("bar");
     assert_eq!(
         entries(&picker, cx),
@@ -803,14 +770,13 @@ async fn a_new_query_clears_the_list_before_the_new_run_lands(cx: &mut TestAppCo
         "the list cleared as soon as the new query arrived"
     );
 
-    // Once the debounce elapses and the new run lands, its entries appear.
+    // Once the debounce elapses, the new run's entries appear.
     cx.executor()
         .advance_clock(QUERY_DEBOUNCE + FLUSH_INTERVAL * 2);
     cx.run_until_parked();
     assert_eq!(entries(&picker, cx), vec!["c.rs"]);
 }
 
-/// Emptying the Query suppresses the Source and clears the list.
 #[gpui::test]
 async fn emptying_the_query_suppresses_the_source(cx: &mut TestAppContext) {
     let (harness, cx) = setup_query(QUERY_CONFIG, vec![emitting(&["a.rs", "b.rs"])], cx).await;
@@ -836,10 +802,9 @@ async fn emptying_the_query_suppresses_the_source(cx: &mut TestAppContext) {
     assert_eq!(status(&picker, cx), None);
 }
 
-/// A straggler batch from a killed run does not pollute the new run's list.
 #[gpui::test]
 async fn a_straggler_from_a_killed_run_is_ignored(cx: &mut TestAppContext) {
-    // First run emits one line, then waits a long time before exiting — so it
+    // First run emits one line, then waits a long time before exiting, so it
     // is still in flight when the second Query arrives and kills it. Its late
     // exit must not reach the second run's list.
     let (harness, cx) = setup_query(
@@ -879,8 +844,6 @@ async fn a_straggler_from_a_killed_run_is_ignored(cx: &mut TestAppContext) {
     assert_eq!(entries(&picker, cx), vec!["fresh.rs"]);
 }
 
-/// Enter while a query's debounce is still pending makes the run spawn
-/// immediately (bypassing the debounce) and confirms once the result lands.
 #[gpui::test]
 async fn an_enter_during_the_debounce_forces_the_spawn_and_confirms(cx: &mut TestAppContext) {
     let (harness, cx) = setup_query(QUERY_CONFIG, vec![emitting(&["a.rs"])], cx).await;
@@ -905,8 +868,6 @@ async fn an_enter_during_the_debounce_forces_the_spawn_and_confirms(cx: &mut Tes
     assert!(active_finder(&harness, cx).is_none(), "the modal dismissed");
 }
 
-/// The typed Query is substituted for `{query}` in the Source's args before
-/// the process spawns.
 #[gpui::test]
 async fn the_query_is_substituted_into_the_spawned_args(cx: &mut TestAppContext) {
     let (with_runner, cx) =
@@ -928,7 +889,6 @@ async fn the_query_is_substituted_into_the_spawned_args(cx: &mut TestAppContext)
     );
 }
 
-/// Only exists so a Finder Outcome has a registered action to dispatch.
 #[derive(Debug, PartialEq, Clone, serde::Deserialize, schemars::JsonSchema, gpui::Action)]
 #[action(namespace = finder_test)]
 #[serde(deny_unknown_fields)]

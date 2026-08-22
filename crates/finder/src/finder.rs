@@ -28,8 +28,6 @@ pub use source::{
     SourceRunner, SourceStream, SourceUpdate, run_source, set_source_runner,
 };
 
-/// Opens a configured Finder by name.
-///
 /// Finder names are action *arguments* rather than action names because GPUI
 /// collects actions at link time; see
 /// `docs/adr/0001-finders-dispatch-via-a-parameterized-action.md`.
@@ -54,8 +52,7 @@ pub fn init(fs: Arc<dyn Fs>, cx: &mut App) {
     init_with_registry(registry, cx);
 }
 
-/// Registration split out so tests can supply a registry over a fake
-/// filesystem instead of the real config directory.
+/// Split out so tests can supply a registry over a fake filesystem.
 pub fn init_with_registry(registry: gpui::Entity<FinderRegistry>, cx: &mut App) {
     FinderRegistry::set_global(registry, cx);
     cx.observe_new(register_workspace_actions).detach();

@@ -86,10 +86,9 @@ impl PositionedPreview {
         };
 
         // Resolve every Finder path here rather than forwarding unpositioned
-        // paths to the inner backend. That keeps all Finder loads under this
-        // task's cancellation, so an older path cannot overwrite a newer one.
-        // This mirrors picker_preview's path-loading flow, but stays in Finder
-        // so the fork does not patch the upstream preview crates.
+        // paths: that keeps all Finder loads under this task's cancellation,
+        // so an older path cannot overwrite a newer one. Mirrors
+        // picker_preview's flow without patching upstream crates.
         let open_task = self.project.update(cx, |project, cx| {
             match project.project_path_for_absolute_path(&path, cx) {
                 Some(project_path) => {
@@ -126,8 +125,8 @@ impl PositionedPreview {
     }
 }
 
-// This mirrors the position conversion used by outcome::open_path: external
-// rows and columns are 1-based, while buffer points and offsets are 0-based.
+// External rows and columns are 1-based; buffer points and offsets are
+// 0-based. Mirrors outcome::open_path.
 fn match_location_for_position(buffer: &Buffer, position: &PathWithPosition) -> MatchLocation {
     let snapshot = buffer.text_snapshot();
     let point = snapshot.point_from_external_input(
