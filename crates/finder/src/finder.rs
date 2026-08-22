@@ -4,6 +4,7 @@ mod finder_tests;
 mod delegate;
 mod list;
 mod outcome;
+mod positioned_preview;
 mod registry;
 mod source;
 

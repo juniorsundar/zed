@@ -9,10 +9,9 @@
 
 ## Remaining
 
-- [ ] Positioned path previews. `open_path_at_position` uses the location when
-  confirming, but `picker::PreviewUpdate::from_path` accepts only a path.
-  Extend Picker to carry an optional `PathWithPosition` and scroll/highlight it
-  after the preview buffer loads; then pass it through Finder.
+- [x] Positioned path previews. Finder wraps the existing preview backend so
+  `open_path_at_position` previews and highlights the target line without
+  modifying the upstream Picker or picker-preview crates.
 - [ ] Command-driven previews.
 - [ ] `run_command` Outcome.
 - [ ] Configurable Source working directory.
