@@ -2,6 +2,7 @@ use crate::{
     Open, QUERY_DEBOUNCE,
     delegate::{FinderDelegate, FinderPicker},
     init_with_registry,
+    outcome::{CommandExit, set_command_runner, test_support::ScriptedCommandRunner},
     registry::FinderRegistry,
     source::{
         FLUSH_INTERVAL, SOURCE_TIMEOUT, set_source_runner,
@@ -60,6 +61,7 @@ struct Harness {
 struct HarnessWithRunner {
     harness: Harness,
     runner: Arc<ScriptedRunner>,
+    command_runner: Arc<ScriptedCommandRunner>,
 }
 
 async fn setup<'a>(
@@ -130,8 +132,11 @@ async fn setup_with_runner<'a>(
         }
     });
     let runner_handle = runner.clone();
+    let command_runner = Arc::new(ScriptedCommandRunner::succeeding());
+    let command_runner_handle = command_runner.clone();
     cx.update(|cx| {
         set_source_runner(runner, cx);
+        set_command_runner(command_runner, cx);
         let registry =
             cx.new(|cx| FinderRegistry::new(app_state.fs.clone(), PathBuf::from(CONFIG_PATH), cx));
         init_with_registry(registry, cx);
@@ -147,6 +152,7 @@ async fn setup_with_runner<'a>(
         HarnessWithRunner {
             harness: Harness { workspace },
             runner: runner_handle,
+            command_runner: command_runner_handle,
         },
         cx,
     )
@@ -517,6 +523,155 @@ async fn confirming_a_dispatch_action_outcome_substitutes_the_entry(cx: &mut Tes
     let recorded = recorded.lock().expect("lock").clone();
     assert_eq!(recorded, vec!["picked-a.rs".to_string()]);
     assert!(active_finder(&harness, cx).is_none(), "the modal dismissed");
+}
+
+#[gpui::test]
+async fn confirming_a_run_command_outcome_substitutes_fields(cx: &mut TestAppContext) {
+    let (with_runner, cx) = setup_with_runner(
+        r#"
+        [finder.demo]
+        delimiter = ":"
+        source = { type = "command", command = "list" }
+        outcome = { type = "run_command", command = "git", args = ["checkout", "{1}", "--track={2}"] }
+        "#,
+        ScriptedRunnerSpec::Steps(emitting(&["feature:origin/feature"])),
+        cx,
+    )
+    .await;
+
+    open_demo(cx);
+    cx.run_until_parked();
+    cx.dispatch_action(menu::Confirm);
+    cx.run_until_parked();
+
+    assert_eq!(
+        with_runner.command_runner.invocations(),
+        vec![(
+            "git".to_owned(),
+            vec![
+                "checkout".to_owned(),
+                "feature".to_owned(),
+                "--track=origin/feature".to_owned(),
+            ],
+        )]
+    );
+    assert_eq!(
+        with_runner.command_runner.working_directories(),
+        vec![PathBuf::from("/project")]
+    );
+    assert!(
+        active_finder(&with_runner.harness, cx).is_none(),
+        "the modal dismissed"
+    );
+    assert!(
+        with_runner
+            .harness
+            .workspace
+            .read_with(cx, |workspace, _| workspace.notification_ids().is_empty()),
+        "successful commands stay quiet"
+    );
+}
+
+#[gpui::test]
+async fn a_run_command_with_a_missing_field_is_not_spawned(cx: &mut TestAppContext) {
+    let (with_runner, cx) = setup_with_runner(
+        r#"
+        [finder.demo]
+        source = { type = "command", command = "list" }
+        outcome = { type = "run_command", command = "git", args = ["checkout", "{2}"] }
+        "#,
+        ScriptedRunnerSpec::Steps(emitting(&["only-one-field"])),
+        cx,
+    )
+    .await;
+
+    open_demo(cx);
+    cx.run_until_parked();
+    cx.dispatch_action(menu::Confirm);
+    cx.run_until_parked();
+
+    assert!(with_runner.command_runner.invocations().is_empty());
+    assert_eq!(
+        with_runner
+            .harness
+            .workspace
+            .read_with(cx, |workspace, _| workspace.notification_ids().len()),
+        1
+    );
+}
+
+#[gpui::test]
+async fn a_failed_run_command_is_reported_in_the_workspace(cx: &mut TestAppContext) {
+    let (with_runner, cx) = setup_with_runner(
+        r#"
+        [finder.demo]
+        source = { type = "command", command = "list" }
+        outcome = { type = "run_command", command = "git", args = ["checkout", "{}"] }
+        "#,
+        ScriptedRunnerSpec::Steps(emitting(&["missing-branch"])),
+        cx,
+    )
+    .await;
+    cx.update(|_, cx| {
+        set_command_runner(
+            Arc::new(ScriptedCommandRunner::returning(CommandExit {
+                code: Some(1),
+                stdout: Some("stdout detail".into()),
+                stderr: Some("fatal: invalid reference".into()),
+            })),
+            cx,
+        );
+    });
+
+    open_demo(cx);
+    cx.run_until_parked();
+    let notifications_before = with_runner
+        .harness
+        .workspace
+        .read_with(cx, |workspace, _| workspace.notification_ids().len());
+    cx.dispatch_action(menu::Confirm);
+    cx.run_until_parked();
+
+    let notifications_after = with_runner
+        .harness
+        .workspace
+        .read_with(cx, |workspace, _| workspace.notification_ids().len());
+    assert_eq!(notifications_after, notifications_before + 1);
+}
+
+#[gpui::test]
+async fn a_run_command_spawn_failure_is_reported_in_the_workspace(cx: &mut TestAppContext) {
+    let (with_runner, cx) = setup_with_runner(
+        r#"
+        [finder.demo]
+        source = { type = "command", command = "list" }
+        outcome = { type = "run_command", command = "missing-command" }
+        "#,
+        ScriptedRunnerSpec::Steps(emitting(&["entry"])),
+        cx,
+    )
+    .await;
+    cx.update(|_, cx| {
+        set_command_runner(
+            Arc::new(ScriptedCommandRunner::failing_to_spawn("not found")),
+            cx,
+        );
+    });
+
+    open_demo(cx);
+    cx.run_until_parked();
+    let notifications_before = with_runner
+        .harness
+        .workspace
+        .read_with(cx, |workspace, _| workspace.notification_ids().len());
+    cx.dispatch_action(menu::Confirm);
+    cx.run_until_parked();
+
+    let notifications_after = with_runner
+        .harness
+        .workspace
+        .read_with(cx, |workspace, _| workspace.notification_ids().len());
+    assert_eq!(notifications_after, notifications_before + 1);
 }
 
 /// The path is the second Field (`git status --porcelain` shape).

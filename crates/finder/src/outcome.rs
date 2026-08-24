@@ -1,9 +1,150 @@
-use crate::config::{Outcome, substitute, substitute_json};
+use crate::config::{Outcome, substitute, substitute_args, substitute_json};
+use async_trait::async_trait;
+use collections::HashMap;
 use editor::Editor;
-use gpui::{App, TaskExt as _, WeakEntity, Window};
-use std::path::{Path, PathBuf};
+use futures::{AsyncRead, AsyncReadExt as _, future};
+use gpui::{App, AppContext as _, TaskExt as _, WeakEntity, Window};
+use project::Project;
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 use util::{ResultExt as _, paths::PathWithPosition};
 use workspace::{OpenOptions, Workspace};
+
+const MAX_DIAGNOSTIC_LINE_BYTES: usize = 4 * 1024;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CommandExit {
+    pub code: Option<i32>,
+    pub stdout: Option<String>,
+    pub stderr: Option<String>,
+}
+
+#[async_trait]
+pub trait CommandRunner: Send + Sync {
+    async fn run(
+        &self,
+        command: &str,
+        args: &[String],
+        cwd: &Path,
+        environment: &HashMap<String, String>,
+    ) -> std::io::Result<CommandExit>;
+}
+
+struct DefaultCommandRunner;
+struct GlobalCommandRunner(Arc<dyn CommandRunner>);
+
+impl gpui::Global for GlobalCommandRunner {}
+
+#[cfg(test)]
+pub fn set_command_runner(runner: Arc<dyn CommandRunner>, cx: &mut App) {
+    cx.set_global(GlobalCommandRunner(runner));
+}
+
+fn command_runner(cx: &App) -> Arc<dyn CommandRunner> {
+    cx.try_global::<GlobalCommandRunner>()
+        .map(|runner| runner.0.clone())
+        .unwrap_or_else(|| Arc::new(DefaultCommandRunner))
+}
+
+struct RunningCommand {
+    child: util::process::Child,
+    exited: bool,
+}
+
+impl Drop for RunningCommand {
+    fn drop(&mut self) {
+        if !self.exited {
+            self.child.kill().log_err();
+        }
+    }
+}
+
+#[async_trait]
+impl CommandRunner for DefaultCommandRunner {
+    async fn run(
+        &self,
+        command: &str,
+        args: &[String],
+        cwd: &Path,
+        environment: &HashMap<String, String>,
+    ) -> std::io::Result<CommandExit> {
+        let mut command = util::command::new_std_command(command);
+        command
+            .args(args)
+            .current_dir(cwd)
+            .env_clear()
+            .envs(environment);
+        let child = util::process::Child::spawn(
+            command,
+            std::process::Stdio::null(),
+            std::process::Stdio::piped(),
+            std::process::Stdio::piped(),
+        )
+        .map_err(std::io::Error::other)?;
+        let mut running = RunningCommand {
+            child,
+            exited: false,
+        };
+        let stdout = running.child.stdout.take().ok_or_else(|| {
+            std::io::Error::other("the command was spawned without a stdout pipe")
+        })?;
+        let stderr = running.child.stderr.take().ok_or_else(|| {
+            std::io::Error::other("the command was spawned without a stderr pipe")
+        })?;
+
+        let (stdout, stderr) =
+            future::try_join(first_non_empty_line(stdout), first_non_empty_line(stderr)).await?;
+        let status = running.child.status().await?;
+        running.exited = true;
+
+        Ok(CommandExit {
+            code: status.code(),
+            stdout,
+            stderr,
+        })
+    }
+}
+
+async fn first_non_empty_line(
+    mut output: impl AsyncRead + Unpin,
+) -> std::io::Result<Option<String>> {
+    let mut retained = None;
+    let mut line = Vec::new();
+    let mut buffer = [0; 8 * 1024];
+
+    loop {
+        let read = output.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        if retained.is_some() {
+            continue;
+        }
+
+        for byte in &buffer[..read] {
+            if *byte == b'\n' {
+                let candidate = String::from_utf8_lossy(&line).trim().to_owned();
+                line.clear();
+                if !candidate.is_empty() {
+                    retained = Some(candidate);
+                    break;
+                }
+            } else if line.len() < MAX_DIAGNOSTIC_LINE_BYTES {
+                line.push(*byte);
+            }
+        }
+    }
+
+    if retained.is_none() {
+        let candidate = String::from_utf8_lossy(&line).trim().to_owned();
+        if !candidate.is_empty() {
+            retained = Some(candidate);
+        }
+    }
+    Ok(retained)
+}
 
 pub fn resolve_entry_path(entry: &str, cwd: &Path) -> PathBuf {
     let path = Path::new(entry);
@@ -43,6 +184,7 @@ pub fn apply_outcome(
     cwd: &Path,
     delimiter: Option<&str>,
     workspace: &WeakEntity<Workspace>,
+    project: &gpui::Entity<Project>,
     window: &mut Window,
     cx: &mut App,
 ) {
@@ -70,6 +212,80 @@ pub fn apply_outcome(
                 }
             }
         }
+        Outcome::RunCommand { command, args } => {
+            let args = match substitute_args(args, entry, delimiter) {
+                Ok(args) => args,
+                Err(error) => return show_error(workspace, error.to_string(), cx),
+            };
+            let environment = project.update(cx, |project, cx| {
+                let worktree = project.visible_worktrees(cx).next()?;
+                Some(project.environment().update(cx, |environment, cx| {
+                    environment.worktree_environment(worktree, cx)
+                }))
+            });
+            let runner = command_runner(cx);
+            let command = command.clone();
+            let cwd = cwd.to_path_buf();
+            let workspace = workspace.clone();
+            let command_workspace = workspace.clone();
+
+            workspace
+                .update(cx, |_, cx| {
+                    cx.spawn(async move |_, cx| {
+                        let environment = match environment {
+                            Some(environment) => environment.await,
+                            None => None,
+                        };
+                        let Some(environment) = environment else {
+                            command_workspace
+                                .update(cx, |workspace, cx| {
+                                    workspace.show_error(
+                                        format!(
+                                            "Could not run `{command}`: the project environment was unavailable"
+                                        ),
+                                        cx,
+                                    )
+                                })
+                                .log_err();
+                            return;
+                        };
+                        let command_for_run = command.clone();
+                        let result = cx
+                            .background_spawn(async move {
+                                runner
+                                    .run(&command_for_run, &args, &cwd, &environment)
+                                    .await
+                            })
+                            .await;
+
+                        let error = match result {
+                            Ok(CommandExit { code: Some(0), .. }) => return,
+                            Ok(exit) => command_failure(&command, exit),
+                            Err(error) => format!("Could not run `{command}`: {error}"),
+                        };
+                        command_workspace
+                            .update(cx, |workspace, cx| workspace.show_error(error, cx))
+                            .log_err();
+                    })
+                    .detach();
+                })
+                .log_err();
+        }
+    }
+}
+
+fn command_failure(command: &str, exit: CommandExit) -> String {
+    let status = match exit.code {
+        Some(code) => format!("exited with status {code}"),
+        None => "was terminated by a signal".to_owned(),
+    };
+    let detail = exit
+        .stderr
+        .filter(|detail| !detail.trim().is_empty())
+        .or_else(|| exit.stdout.filter(|detail| !detail.trim().is_empty()));
+    match detail {
+        Some(detail) => format!("`{command}` {status}: {detail}"),
+        None => format!("`{command}` {status}"),
     }
 }
 
@@ -135,6 +351,76 @@ fn show_error(workspace: &WeakEntity<Workspace>, message: String, cx: &mut App) 
     workspace
         .update(cx, |workspace, cx| workspace.show_error(message, cx))
         .log_err();
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use std::sync::Mutex;
+
+    pub struct ScriptedCommandRunner {
+        result: std::io::Result<CommandExit>,
+        invocations: Mutex<Vec<(String, Vec<String>)>>,
+        working_directories: Mutex<Vec<PathBuf>>,
+    }
+
+    impl ScriptedCommandRunner {
+        pub fn succeeding() -> Self {
+            Self::returning(CommandExit {
+                code: Some(0),
+                stdout: None,
+                stderr: None,
+            })
+        }
+
+        pub fn returning(exit: CommandExit) -> Self {
+            Self {
+                result: Ok(exit),
+                invocations: Mutex::new(Vec::new()),
+                working_directories: Mutex::new(Vec::new()),
+            }
+        }
+
+        pub fn failing_to_spawn(reason: &str) -> Self {
+            Self {
+                result: Err(std::io::Error::other(reason.to_owned())),
+                invocations: Mutex::new(Vec::new()),
+                working_directories: Mutex::new(Vec::new()),
+            }
+        }
+
+        pub fn invocations(&self) -> Vec<(String, Vec<String>)> {
+            self.invocations.lock().expect("unpoisoned").clone()
+        }
+
+        pub fn working_directories(&self) -> Vec<PathBuf> {
+            self.working_directories.lock().expect("unpoisoned").clone()
+        }
+    }
+
+    #[async_trait]
+    impl CommandRunner for ScriptedCommandRunner {
+        async fn run(
+            &self,
+            command: &str,
+            args: &[String],
+            cwd: &Path,
+            _environment: &HashMap<String, String>,
+        ) -> std::io::Result<CommandExit> {
+            self.invocations
+                .lock()
+                .expect("unpoisoned")
+                .push((command.to_owned(), args.to_vec()));
+            self.working_directories
+                .lock()
+                .expect("unpoisoned")
+                .push(cwd.to_path_buf());
+            match &self.result {
+                Ok(exit) => Ok(exit.clone()),
+                Err(error) => Err(std::io::Error::new(error.kind(), error.to_string())),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -233,6 +519,50 @@ mod tests {
         .expect_err("the entry has no third field");
 
         assert!(error.contains("field 3"), "got {error:?}");
+    }
+
+    #[test]
+    fn command_diagnostics_skip_blank_lines_and_bound_the_first_detail() {
+        let long_detail = "x".repeat(MAX_DIAGNOSTIC_LINE_BYTES + 100);
+        let output = format!("\n  \r\n{long_detail}\nignored\n");
+        let retained = futures::executor::block_on(first_non_empty_line(futures::io::Cursor::new(
+            output.into_bytes(),
+        )))
+        .expect("output drained")
+        .expect("diagnostic retained");
+
+        assert_eq!(retained, "x".repeat(MAX_DIAGNOSTIC_LINE_BYTES));
+    }
+
+    #[test]
+    fn a_command_failure_prefers_stderr_and_reports_the_exit_status() {
+        let message = command_failure(
+            "git",
+            CommandExit {
+                code: Some(128),
+                stdout: Some("stdout detail".into()),
+                stderr: Some("fatal: invalid reference".into()),
+            },
+        );
+
+        assert_eq!(
+            message,
+            "`git` exited with status 128: fatal: invalid reference"
+        );
+    }
+
+    #[test]
+    fn a_command_failure_uses_stdout_when_stderr_is_empty() {
+        let message = command_failure(
+            "git",
+            CommandExit {
+                code: Some(1),
+                stdout: Some("stdout detail".into()),
+                stderr: Some(String::new()),
+            },
+        );
+
+        assert_eq!(message, "`git` exited with status 1: stdout detail");
     }
 
     #[test]

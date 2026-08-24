@@ -537,6 +537,7 @@ impl PickerDelegate for FinderDelegate {
         let outcome = self.config.outcome.clone();
         let delimiter = self.config.delimiter.clone();
         let workspace = self.workspace.clone();
+        let project = self.project.clone();
         let cwd = self.cwd.clone();
 
         // Dismiss first so a dispatched action lands on the focus the modal was
@@ -549,6 +550,7 @@ impl PickerDelegate for FinderDelegate {
                 cwd.as_ref(),
                 delimiter.as_deref(),
                 &workspace,
+                &project,
                 window,
                 cx,
             );
