@@ -53,7 +53,7 @@ pub fn has_query_placeholder(args: &[String]) -> bool {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Outcome {
     OpenPath {
         /// Defaults to the whole Entry.
@@ -71,6 +71,11 @@ pub enum Outcome {
         #[serde(default)]
         args: Option<serde_json::Value>,
     },
+    RunCommand {
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+    },
 }
 
 impl Outcome {
@@ -80,7 +85,7 @@ impl Outcome {
             Outcome::OpenPath { path } | Outcome::OpenPathAtPosition { path } => {
                 Some(path.as_deref().unwrap_or(WHOLE_ENTRY))
             }
-            Outcome::DispatchAction { .. } => None,
+            Outcome::DispatchAction { .. } | Outcome::RunCommand { .. } => None,
         }
     }
 
@@ -466,6 +471,61 @@ mod tests {
         let parsed = parse_ok("");
         assert!(parsed.finders.is_empty());
         assert!(parsed.errors.is_empty());
+    }
+
+    #[test]
+    fn run_command_carries_its_executable_and_arguments() {
+        let parsed = parse_ok(
+            r#"
+            [finder.checkout]
+            source = { type = "command", command = "git", args = ["branch", "--format=%(refname:short)"] }
+            outcome = { type = "run_command", command = "git", args = ["checkout", "{1}"] }
+            "#,
+        );
+
+        let finder = parsed.finders.get("checkout").expect("finder present");
+        assert_eq!(
+            finder.outcome,
+            Outcome::RunCommand {
+                command: "git".into(),
+                args: vec!["checkout".into(), "{1}".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn run_command_defaults_to_no_arguments() {
+        let parsed = parse_ok(
+            r#"
+            [finder.refresh]
+            source = { type = "command", command = "git" }
+            outcome = { type = "run_command", command = "refresh-index" }
+            "#,
+        );
+
+        let finder = parsed.finders.get("refresh").expect("finder present");
+        assert_eq!(
+            finder.outcome,
+            Outcome::RunCommand {
+                command: "refresh-index".into(),
+                args: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn run_command_rejects_execution_policy_fields() {
+        let parsed = parse_ok(
+            r#"
+            [finder.checkout]
+            source = { type = "command", command = "git" }
+            outcome = { type = "run_command", command = "git", timeout = 5 }
+            "#,
+        );
+
+        assert!(parsed.finders.is_empty());
+        let error = parsed.errors.get("checkout").expect("finder error present");
+        assert!(error.contains("timeout"), "unexpected error: {error}");
     }
 
     #[test]
