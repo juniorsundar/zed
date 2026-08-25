@@ -42,7 +42,7 @@ pub trait SourceRunner: Send + Sync {
         &self,
         command: &str,
         args: &[String],
-        cwd: &Path,
+        cwd: Option<&Path>,
         env: &HashMap<String, String>,
     ) -> Result<SourceStream, std::io::Error>;
 }
@@ -69,18 +69,21 @@ impl SourceRunner for DefaultSourceRunner {
         &self,
         command: &str,
         args: &[String],
-        cwd: &Path,
+        cwd: Option<&Path>,
         env: &HashMap<String, String>,
     ) -> Result<SourceStream, std::io::Error> {
-        let mut child = util::command::new_command(command)
+        let mut command = util::command::new_command(command);
+        command
             .args(args)
-            .current_dir(cwd)
             .envs(env)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()?;
+            .kill_on_drop(true);
+        if let Some(cwd) = cwd {
+            command.current_dir(cwd);
+        }
+        let mut child = command.spawn()?;
 
         let stdout = child.stdout.take().ok_or_else(|| {
             std::io::Error::other("the child process was spawned without a stdout pipe")
@@ -161,12 +164,12 @@ pub async fn run_source(
     runner: Arc<dyn SourceRunner>,
     command: String,
     args: Vec<String>,
-    cwd: Arc<Path>,
+    cwd: Option<Arc<Path>>,
     env: HashMap<String, String>,
     executor: BackgroundExecutor,
     updates: mpsc::UnboundedSender<SourceUpdate>,
 ) {
-    let mut events = match runner.spawn(&command, &args, cwd.as_ref(), &env).await {
+    let mut events = match runner.spawn(&command, &args, cwd.as_deref(), &env).await {
         Ok(events) => events,
         Err(error) => {
             updates
@@ -277,6 +280,7 @@ fn exit_details(code: Option<i32>, stderr: &str) -> String {
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
+    use std::path::PathBuf;
 
     #[derive(Debug, Clone)]
     pub enum Step {
@@ -317,6 +321,8 @@ pub(crate) mod test_support {
         executor: BackgroundExecutor,
         tail: Vec<Step>,
         spawned_args: std::sync::Mutex<Vec<Vec<String>>>,
+        spawned_commands: std::sync::Mutex<Vec<String>>,
+        spawned_cwd: std::sync::Mutex<Vec<Option<PathBuf>>>,
     }
 
     impl ScriptedRunner {
@@ -331,6 +337,8 @@ pub(crate) mod test_support {
                 executor,
                 tail: vec![exit_ok()],
                 spawned_args: std::sync::Mutex::new(Vec::new()),
+                spawned_commands: std::sync::Mutex::new(Vec::new()),
+                spawned_cwd: std::sync::Mutex::new(Vec::new()),
             }
         }
 
@@ -341,11 +349,23 @@ pub(crate) mod test_support {
                 executor,
                 tail: vec![exit_ok()],
                 spawned_args: std::sync::Mutex::new(Vec::new()),
+                spawned_commands: std::sync::Mutex::new(Vec::new()),
+                spawned_cwd: std::sync::Mutex::new(Vec::new()),
             }
         }
 
         pub fn spawned_args(&self) -> Vec<Vec<String>> {
             self.spawned_args.lock().expect("unpoisoned").clone()
+        }
+
+        /// The programs this runner was asked to spawn, in order.
+        pub fn spawned_commands(&self) -> Vec<String> {
+            self.spawned_commands.lock().expect("unpoisoned").clone()
+        }
+
+        /// The working directories this runner was asked to spawn in, in order.
+        pub fn spawned_cwd(&self) -> Vec<Option<PathBuf>> {
+            self.spawned_cwd.lock().expect("unpoisoned").clone()
         }
     }
 
@@ -353,9 +373,9 @@ pub(crate) mod test_support {
     impl SourceRunner for ScriptedRunner {
         async fn spawn(
             &self,
-            _command: &str,
+            command: &str,
             args: &[String],
-            _cwd: &Path,
+            cwd: Option<&Path>,
             _env: &HashMap<String, String>,
         ) -> Result<SourceStream, std::io::Error> {
             if let Some(reason) = &self.spawn_error {
@@ -366,6 +386,14 @@ pub(crate) mod test_support {
                 .lock()
                 .expect("unpoisoned")
                 .push(args.to_vec());
+            self.spawned_commands
+                .lock()
+                .expect("unpoisoned")
+                .push(command.to_owned());
+            self.spawned_cwd
+                .lock()
+                .expect("unpoisoned")
+                .push(cwd.map(|cwd| cwd.to_path_buf()));
 
             let steps = {
                 let mut queue = self.per_spawn.lock().expect("unpoisoned");
@@ -432,7 +460,7 @@ mod tests {
             Arc::new(runner),
             command,
             args,
-            Arc::from(Path::new("/project")),
+            Some(Arc::from(Path::new("/project"))),
             HashMap::default(),
             executor.clone(),
             sender,

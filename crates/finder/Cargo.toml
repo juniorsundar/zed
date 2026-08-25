@@ -27,6 +27,7 @@ picker.workspace = true
 picker_preview.workspace = true
 parking_lot.workspace = true
 project.workspace = true
+remote.workspace = true
 rope.workspace = true
 schemars.workspace = true
 serde.workspace = true
@@ -46,6 +47,10 @@ theme_settings.workspace = true
 fs = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
 project = { workspace = true, features = ["test-support"] }
+remote = { workspace = true, features = ["test-support"] }
+rpc.workspace = true
+release_channel.workspace = true
+semver.workspace = true
 settings = { workspace = true, features = ["test-support"] }
 util = { workspace = true, features = ["test-support"] }
 workspace = { workspace = true, features = ["test-support"] }

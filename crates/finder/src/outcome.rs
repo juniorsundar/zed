@@ -1,4 +1,5 @@
-use crate::config::{Outcome, substitute, substitute_args, substitute_json};
+use crate::config::{Outcome, RunOn, substitute, substitute_args, substitute_json};
+use crate::remote::resolve_command;
 use async_trait::async_trait;
 use collections::HashMap;
 use editor::Editor;
@@ -27,7 +28,7 @@ pub trait CommandRunner: Send + Sync {
         &self,
         command: &str,
         args: &[String],
-        cwd: &Path,
+        cwd: Option<&Path>,
         environment: &HashMap<String, String>,
     ) -> std::io::Result<CommandExit>;
 }
@@ -67,15 +68,14 @@ impl CommandRunner for DefaultCommandRunner {
         &self,
         command: &str,
         args: &[String],
-        cwd: &Path,
+        cwd: Option<&Path>,
         environment: &HashMap<String, String>,
     ) -> std::io::Result<CommandExit> {
         let mut command = util::command::new_std_command(command);
-        command
-            .args(args)
-            .current_dir(cwd)
-            .env_clear()
-            .envs(environment);
+        command.args(args).env_clear().envs(environment);
+        if let Some(cwd) = cwd {
+            command.current_dir(cwd);
+        }
         let child = util::process::Child::spawn(
             command,
             std::process::Stdio::null(),
@@ -183,6 +183,7 @@ pub fn apply_outcome(
     entry: &str,
     cwd: &Path,
     delimiter: Option<&str>,
+    run_on: RunOn,
     workspace: &WeakEntity<Workspace>,
     project: &gpui::Entity<Project>,
     window: &mut Window,
@@ -225,6 +226,7 @@ pub fn apply_outcome(
             });
             let runner = command_runner(cx);
             let command = command.clone();
+            let remote_transport = project.read(cx).remote_client();
             let cwd = cwd.to_path_buf();
             let workspace = workspace.clone();
             let command_workspace = workspace.clone();
@@ -249,11 +251,37 @@ pub fn apply_outcome(
                                 .log_err();
                             return;
                         };
-                        let command_for_run = command.clone();
+                        let resolved = match resolve_command(
+                            remote_transport.as_ref(),
+                            run_on,
+                            command.clone(),
+                            args.clone(),
+                            &cwd,
+                            environment,
+                            cx,
+                        ) {
+                            Ok(resolved) => resolved,
+                            Err(error) => {
+                                command_workspace
+                                    .update(cx, |workspace, cx| {
+                                        workspace.show_error(
+                                            format!("Could not run `{command}`: {error}"),
+                                            cx,
+                                        )
+                                    })
+                                    .log_err();
+                                return;
+                            }
+                        };
                         let result = cx
                             .background_spawn(async move {
                                 runner
-                                    .run(&command_for_run, &args, &cwd, &environment)
+                                    .run(
+                                        &resolved.command,
+                                        &resolved.args,
+                                        resolved.cwd.as_deref(),
+                                        &resolved.env,
+                                    )
                                     .await
                             })
                             .await;
@@ -361,7 +389,7 @@ pub(crate) mod test_support {
     pub struct ScriptedCommandRunner {
         result: std::io::Result<CommandExit>,
         invocations: Mutex<Vec<(String, Vec<String>)>>,
-        working_directories: Mutex<Vec<PathBuf>>,
+        working_directories: Mutex<Vec<Option<PathBuf>>>,
     }
 
     impl ScriptedCommandRunner {
@@ -393,7 +421,7 @@ pub(crate) mod test_support {
             self.invocations.lock().expect("unpoisoned").clone()
         }
 
-        pub fn working_directories(&self) -> Vec<PathBuf> {
+        pub fn working_directories(&self) -> Vec<Option<PathBuf>> {
             self.working_directories.lock().expect("unpoisoned").clone()
         }
     }
@@ -404,7 +432,7 @@ pub(crate) mod test_support {
             &self,
             command: &str,
             args: &[String],
-            cwd: &Path,
+            cwd: Option<&Path>,
             _environment: &HashMap<String, String>,
         ) -> std::io::Result<CommandExit> {
             self.invocations
@@ -414,7 +442,7 @@ pub(crate) mod test_support {
             self.working_directories
                 .lock()
                 .expect("unpoisoned")
-                .push(cwd.to_path_buf());
+                .push(cwd.map(|cwd| cwd.to_path_buf()));
             match &self.result {
                 Ok(exit) => Ok(exit.clone()),
                 Err(error) => Err(std::io::Error::new(error.kind(), error.to_string())),

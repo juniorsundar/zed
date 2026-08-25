@@ -14,6 +14,7 @@ use gpui::{AppContext as _, Entity, TestAppContext, VisualTestContext};
 use multi_buffer::MultiBufferOffset;
 use picker::{Picker, PickerDelegate as _, PreviewSource, PreviewUpdate};
 use project::Project;
+use remote::RemoteClient;
 use serde_json::json;
 use std::{
     path::{Path, PathBuf},
@@ -148,6 +149,89 @@ async fn setup_with_runner<'a>(
         cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
     let workspace = multi_workspace.read_with(cx, |multi, _| multi.workspace().clone());
 
+    (
+        HarnessWithRunner {
+            harness: Harness { workspace },
+            runner: runner_handle,
+            command_runner: command_runner_handle,
+        },
+        cx,
+    )
+}
+
+/// Opens a Finder over a remote project so the transport-resolution path is
+/// exercised end to end.
+async fn setup_remote_with_runner<'a>(
+    config: &'static str,
+    spec: ScriptedRunnerSpec,
+    cx: &'a mut TestAppContext,
+    server_cx: &'a mut TestAppContext,
+) -> (HarnessWithRunner, &'a mut VisualTestContext) {
+    let app_state = init_test(cx);
+    let fake_fs = app_state.fs.as_fake();
+
+    let version = semver::Version::new(0, 0, 0);
+    cx.update(|cx| release_channel::init(version.clone(), cx));
+    server_cx.update(|cx| release_channel::init(version, cx));
+
+    fake_fs
+        .insert_tree(Path::new("/config"), json!({ "finders.toml": config }))
+        .await;
+
+    let executor = cx.executor();
+    let runner = Arc::new(match spec {
+        ScriptedRunnerSpec::Steps(steps) => ScriptedRunner::new(steps, executor.clone()),
+        ScriptedRunnerSpec::PerSpawn(per_spawn) => {
+            ScriptedRunner::per_spawn(per_spawn, executor.clone())
+        }
+        ScriptedRunnerSpec::SpawnError(reason) => {
+            ScriptedRunner::failing_to_spawn(reason, executor.clone())
+        }
+    });
+    let runner_handle = runner.clone();
+    let command_runner = Arc::new(ScriptedCommandRunner::succeeding());
+    let command_runner_handle = command_runner.clone();
+
+    let (opts, server_session, connect_guard) =
+        RemoteClient::fake_server(cx, server_cx);
+    let ping_handler = server_cx.new(|_| ());
+    server_session.add_request_handler::<rpc::proto::Ping, _, _, _>(
+        ping_handler.downgrade(),
+        |_entity, _envelope, _cx| async { Ok(rpc::proto::Ack {}) },
+    );
+    drop(connect_guard);
+    let remote_client = RemoteClient::connect_mock(opts, cx).await;
+
+    let project = cx.update(|cx| {
+        set_source_runner(runner, cx);
+        set_command_runner(command_runner, cx);
+        let registry = cx.new(|cx| {
+            FinderRegistry::new(app_state.fs.clone(), PathBuf::from(CONFIG_PATH), cx)
+        });
+        init_with_registry(registry, cx);
+        let project = Project::remote(
+            remote_client.clone(),
+            app_state.client.clone(),
+            app_state.node_runtime.clone(),
+            app_state.user_store.clone(),
+            app_state.languages.clone(),
+            app_state.fs.clone(),
+            false,
+            cx,
+        );
+        project.update(cx, |project, cx| {
+            project.add_test_remote_worktree("/remote/project", cx);
+        });
+        project
+    });
+    cx.run_until_parked();
+
+    let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+        window.activate_window();
+        let workspace = cx.new(|cx| Workspace::new(None, project, app_state, window, cx));
+        MultiWorkspace::new(workspace, window, cx)
+    });
+    let workspace = multi_workspace.read_with(cx, |multi, _| multi.workspace().clone());
     (
         HarnessWithRunner {
             harness: Harness { workspace },
@@ -557,7 +641,7 @@ async fn confirming_a_run_command_outcome_substitutes_fields(cx: &mut TestAppCon
     );
     assert_eq!(
         with_runner.command_runner.working_directories(),
-        vec![PathBuf::from("/project")]
+        vec![Some(PathBuf::from("/project"))]
     );
     assert!(
         active_finder(&with_runner.harness, cx).is_none(),
@@ -1049,4 +1133,118 @@ async fn the_query_is_substituted_into_the_spawned_args(cx: &mut TestAppContext)
 #[serde(deny_unknown_fields)]
 struct Record {
     value: String,
+}
+
+#[gpui::test]
+async fn a_remote_finder_runs_its_source_through_the_transport(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    let (with_runner, cx) = setup_remote_with_runner(
+        OPEN_PATH_CONFIG,
+        ScriptedRunnerSpec::Steps(emitting(&["a.rs", "b.rs"])),
+        cx,
+        server_cx,
+    )
+    .await;
+
+    open_demo(cx);
+    cx.run_until_parked();
+
+    assert_eq!(
+        with_runner.runner.spawned_commands(),
+        vec!["mock".to_string()],
+        "the Source must be resolved through the transport, not spawned as `list`"
+    );
+
+    assert_eq!(
+        with_runner.runner.spawned_args(),
+        vec![vec!["list".to_string()]],
+        "the resolved transport args must carry the original command"
+    );
+
+    assert_eq!(
+        with_runner.runner.spawned_cwd(),
+        vec![None],
+        "the transport-owned working directory must not reach the local spawn"
+    );
+
+    let picker = active_finder(&with_runner.harness, cx).expect("finder open");
+    assert_eq!(entries(&picker, cx), vec!["a.rs", "b.rs"]);
+}
+
+#[gpui::test]
+async fn a_remote_finder_with_run_on_local_spawns_locally_without_a_working_directory(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    const LOCAL_ONLY_CONFIG: &str = r#"
+        [finder.demo]
+        label = "Demo"
+        run_on = "local"
+        source = { type = "command", command = "list", args = [] }
+        outcome = { type = "open_path" }
+    "#;
+    let (with_runner, cx) = setup_remote_with_runner(
+        LOCAL_ONLY_CONFIG,
+        ScriptedRunnerSpec::Steps(emitting(&["a.rs"])),
+        cx,
+        server_cx,
+    )
+    .await;
+
+    open_demo(cx);
+    cx.run_until_parked();
+
+    assert_eq!(
+        with_runner.runner.spawned_commands(),
+        vec!["list".to_string()],
+        "a forced-local Finder must not go through the transport"
+    );
+    assert_eq!(
+        with_runner.runner.spawned_cwd(),
+        vec![None],
+        "a forced-local spawn on a remote project must not use the remote cwd"
+    );
+}
+
+#[gpui::test]
+async fn a_remote_finder_confirms_a_run_command_outcome_through_the_transport(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    let (with_runner, cx) = setup_remote_with_runner(
+        r#"
+        [finder.demo]
+        source = { type = "command", command = "list" }
+        outcome = { type = "run_command", command = "git", args = ["checkout", "{1}"] }
+        "#,
+        ScriptedRunnerSpec::Steps(emitting(&["feature"])),
+        cx,
+        server_cx,
+    )
+    .await;
+
+    open_demo(cx);
+    cx.run_until_parked();
+    cx.dispatch_action(menu::Confirm);
+    cx.run_until_parked();
+
+    assert_eq!(
+        with_runner.command_runner.invocations(),
+        vec![(
+            "mock".to_string(),
+            vec!["git".to_string(), "checkout".to_string(), "feature".to_string()],
+        )]
+    );
+    assert_eq!(
+        with_runner.command_runner.working_directories(),
+        vec![None],
+        "the run_command must resolve through the transport, not run locally at a remote cwd"
+    )
+        ;
+    assert!(
+        active_finder(&with_runner.harness, cx).is_none(),
+        "the modal dismissed"
+    );
 }
