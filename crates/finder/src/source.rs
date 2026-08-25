@@ -159,17 +159,21 @@ pub enum SourceUpdate {
     Failed(SourceFailure),
 }
 
-/// Runs a command, coalescing output over [`FLUSH_INTERVAL`].
+/// Runs a command, coalescing output over [`FLUSH_INTERVAL`]. `command` is the
+/// user-facing command reported in failures; `program` is the resolved program
+/// to spawn (which differs from `command` when a remote transport wraps it).
 pub async fn run_source(
     runner: Arc<dyn SourceRunner>,
     command: String,
+    program: String,
     args: Vec<String>,
     cwd: Option<Arc<Path>>,
+    success_exit_codes: Vec<i32>,
     env: HashMap<String, String>,
     executor: BackgroundExecutor,
     updates: mpsc::UnboundedSender<SourceUpdate>,
 ) {
-    let mut events = match runner.spawn(&command, &args, cwd.as_deref(), &env).await {
+    let mut events = match runner.spawn(&program, &args, cwd.as_deref(), &env).await {
         Ok(events) => events,
         Err(error) => {
             updates
@@ -222,6 +226,9 @@ pub async fn run_source(
                 send_entries(&updates, &mut pending);
                 let update = match code {
                     Some(0) => SourceUpdate::Finished { truncated: false },
+                    Some(code) if success_exit_codes.contains(&code) => {
+                        SourceUpdate::Finished { truncated: false }
+                    }
                     code => SourceUpdate::Failed(SourceFailure::Failed {
                         command,
                         details: exit_details(code, &stderr),
@@ -444,6 +451,7 @@ mod tests {
         Source::Command {
             command: "git".into(),
             args: Vec::new(),
+            success_exit_codes: Vec::new(),
         }
     }
 
@@ -453,14 +461,21 @@ mod tests {
     ) -> Vec<SourceUpdate> {
         let executor = cx.executor();
         let (sender, receiver) = mpsc::unbounded();
-        let Source::Command { command, args } = source() else {
+        let Source::Command {
+            command,
+            args,
+            success_exit_codes,
+        } = source()
+        else {
             unreachable!()
         };
         let task = cx.background_executor.spawn(run_source(
             Arc::new(runner),
+            command.clone(),
             command,
             args,
             Some(Arc::from(Path::new("/project"))),
+            success_exit_codes,
             HashMap::default(),
             executor.clone(),
             sender,
@@ -520,6 +535,42 @@ mod tests {
         assert!(failure.to_string().contains("No such file or directory"));
     }
 
+    /// A code listed in `success_exit_codes` is treated as success, not
+    /// failure — e.g. `rg` exiting 1 for "no matches", or `git diff` exiting 1
+    /// for "changes found".
+    #[gpui::test]
+    async fn a_declared_success_exit_code_is_not_a_failure(cx: &mut TestAppContext) {
+        let executor = cx.executor();
+        let (sender, receiver) = mpsc::unbounded();
+        let task = cx.background_executor.spawn(run_source(
+            Arc::new(ScriptedRunner::new(
+                vec![Step::Exit {
+                    code: Some(1),
+                    stderr: "",
+                }],
+                executor.clone(),
+            )),
+            "rg".into(),
+            "rg".into(),
+            vec!["--vimgrep".into(), "query".into()],
+            Some(Arc::from(Path::new("/project"))),
+            vec![1],
+            HashMap::default(),
+            executor.clone(),
+            sender,
+        ));
+
+        executor.advance_clock(SOURCE_TIMEOUT * 10);
+        task.await;
+        let updates: Vec<SourceUpdate> = receiver.collect().await;
+
+        assert_eq!(
+            updates.last(),
+            Some(&SourceUpdate::Finished { truncated: false }),
+            "an exit code declared successful must not surface as a failure"
+        );
+    }
+
     #[gpui::test]
     async fn reports_a_non_zero_exit_with_its_first_stderr_line(cx: &mut TestAppContext) {
         let updates = collect(
@@ -536,6 +587,40 @@ mod tests {
             Some(&SourceUpdate::Failed(SourceFailure::Failed {
                 command: "git".into(),
                 details: "fatal: not a git repository".into(),
+            }))
+        );
+    }
+
+    /// The failure names the user's command, not the transport program that
+    /// actually spawned it (e.g. `rg`, not `ssh`, on a remote project).
+    #[gpui::test]
+    async fn failures_name_the_display_command_not_the_program(cx: &mut TestAppContext) {
+        let executor = cx.executor();
+        let (sender, receiver) = mpsc::unbounded();
+        let task = cx.background_executor.spawn(run_source(
+            Arc::new(ScriptedRunner::new(
+                vec![exit_with("fatal: interrupted")],
+                executor.clone(),
+            )),
+            "rg".into(), // the command the user configured
+            "ssh".into(), // the transport program that actually ran
+            vec!["--vimgrep".into(), "query".into()],
+            Some(Arc::from(Path::new("/project"))),
+            Vec::new(),
+            HashMap::default(),
+            executor.clone(),
+            sender,
+        ));
+
+        executor.advance_clock(SOURCE_TIMEOUT * 10);
+        task.await;
+        let updates: Vec<SourceUpdate> = receiver.collect().await;
+
+        assert_eq!(
+            updates.last(),
+            Some(&SourceUpdate::Failed(SourceFailure::Failed {
+                command: "rg".into(),
+                details: "fatal: interrupted".into(),
             }))
         );
     }
