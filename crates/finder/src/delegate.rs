@@ -1,9 +1,11 @@
 use crate::{
     config::{FinderConfig, Preview, Source, substitute_query},
-    outcome::{apply_outcome, resolve_outcome_path},
+    outcome::resolve_outcome_path,
     positioned_preview::{PendingPosition, new_pending_position, positioned_editor_preview},
-    source::{MAX_ENTRIES, SourceUpdate, run_source, source_runner},
+    remote::resolve_command,
+    source::{MAX_ENTRIES, SourceFailure, SourceUpdate, run_source, source_runner},
 };
+use crate::outcome::apply_outcome;
 use collections::HashMap;
 use futures::{StreamExt as _, channel::mpsc};
 use fuzzy_nucleo::{Case, LengthPenalty, StringMatch, StringMatchCandidate};
@@ -107,6 +109,21 @@ pub const QUERY_DEBOUNCE: Duration = Duration::from_millis(150);
 /// Bumped per run; batches carrying a stale generation are dropped.
 type Generation = u64;
 
+/// Surfuses a Source that could not be started. The send only fails once the Picker's update
+/// channel has closed.
+fn send_could_not_spawn(
+    sender: &mpsc::UnboundedSender<SourceUpdate>,
+    command: &str,
+    reason: impl std::fmt::Display,
+) {
+    if let Err(_) = sender.unbounded_send(SourceUpdate::Failed(SourceFailure::CouldNotSpawn {
+        command: command.to_owned(),
+        reason: reason.to_string(),
+    })) {
+        // The picker is gone; there is nobody left to show the failure.
+    }
+}
+
 #[derive(Default)]
 struct SourceState {
     running: bool,
@@ -175,7 +192,9 @@ impl FinderDelegate {
     ) -> Task<()> {
         let runner = source_runner(cx);
         let cwd = self.cwd.clone();
+        let run_on = self.config.run_on;
         let executor = cx.background_executor().clone();
+        let remote_transport = project.read(cx).remote_client();
         let (command, args) = match &self.config.source {
             Source::Command { command, args } | Source::Query { command, args } => {
                 (command.clone(), args.clone())
@@ -196,17 +215,30 @@ impl FinderDelegate {
             };
 
             let (sender, mut updates) = mpsc::unbounded();
-            // Dropping this task kills the child process; it happens when the
-            // picker is dropped.
-            let _source = cx.background_spawn(run_source(
-                runner,
-                command,
-                args,
-                cwd,
+            let source_task = match resolve_command(
+                remote_transport.as_ref(),
+                run_on,
+                command.clone(),
+                args.clone(),
+                &cwd,
                 environment,
-                executor,
-                sender,
-            ));
+                cx,
+            ) {
+                Ok(resolved) => Some(cx.background_spawn(run_source(
+                    runner,
+                    resolved.command,
+                    resolved.args,
+                    resolved.cwd.map(Arc::from),
+                    resolved.env,
+                    executor,
+                    sender,
+                ))),
+                Err(error) => {
+                    send_could_not_spawn(&sender, &command, &error);
+                    None
+                }
+            };
+            let _source = source_task;
 
             while let Some(update) = updates.next().await {
                 let applied = picker.update_in(cx, |picker, window, cx| {
@@ -270,6 +302,8 @@ impl FinderDelegate {
         let command = config.source.command().to_owned();
         let args = substitute_query(config.source.args(), &query);
         let runner = source_runner(cx);
+        let run_on = config.run_on;
+        let remote_transport = project.read(cx).remote_client();
 
         let environment = project.update(cx, |project, cx| {
             let worktree = project.visible_worktrees(cx).next()?;
@@ -306,16 +340,31 @@ impl FinderDelegate {
             };
 
             let (sender, mut updates) = mpsc::unbounded();
-            // Dropping the task kills the child.
-            let _source = cx.background_spawn(run_source(
-                runner,
-                command,
-                args,
-                cwd,
+            // Dropping the task kills the child; hold it until the picker is
+            // dropped rather than scoping it to the match arm below.
+            let _source = match resolve_command(
+                remote_transport.as_ref(),
+                run_on,
+                command.clone(),
+                args.clone(),
+                &cwd,
                 environment,
-                executor,
-                sender,
-            ));
+                cx,
+            ) {
+                Ok(resolved) => Some(cx.background_spawn(run_source(
+                    runner,
+                    resolved.command,
+                    resolved.args,
+                    resolved.cwd.map(Arc::from),
+                    resolved.env,
+                    executor,
+                    sender,
+                ))),
+                Err(error) => {
+                    send_could_not_spawn(&sender, &command, &error);
+                    None
+                }
+            };
 
             while let Some(update) = updates.next().await {
                 let applied = picker.update_in(cx, |picker, _window, cx| {
@@ -536,6 +585,7 @@ impl PickerDelegate for FinderDelegate {
 
         let outcome = self.config.outcome.clone();
         let delimiter = self.config.delimiter.clone();
+        let run_on = self.config.run_on;
         let workspace = self.workspace.clone();
         let project = self.project.clone();
         let cwd = self.cwd.clone();
@@ -549,6 +599,7 @@ impl PickerDelegate for FinderDelegate {
                 &entry,
                 cwd.as_ref(),
                 delimiter.as_deref(),
+                run_on,
                 &workspace,
                 &project,
                 window,

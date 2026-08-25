@@ -100,6 +100,16 @@ pub enum Preview {
     Path,
 }
 
+/// Where a Finder's command-spawning work (its Source and any `run_command`
+/// Outcome) executes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RunOn {
+    #[default]
+    Auto,
+    Local,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct FinderConfig {
     pub name: SharedString,
@@ -109,6 +119,7 @@ pub struct FinderConfig {
     pub outcome: Outcome,
     pub preview: Option<Preview>,
     pub delimiter: Option<String>,
+    pub run_on: RunOn,
 }
 
 #[derive(Debug, Deserialize)]
@@ -122,6 +133,8 @@ struct FinderBody {
     preview: Option<Preview>,
     #[serde(default)]
     delimiter: Option<String>,
+    #[serde(default)]
+    run_on: RunOn,
 }
 
 #[derive(Debug, Deserialize)]
@@ -187,6 +200,7 @@ impl FinderBody {
             outcome: self.outcome,
             preview: self.preview,
             delimiter: self.delimiter,
+            run_on: self.run_on,
         }
     }
 }
@@ -822,5 +836,50 @@ mod tests {
             substitute_query(&["rg".into(), "--files".into()], "foo"),
             vec!["rg", "--files"],
         );
+    }
+
+    #[test]
+    fn run_on_defaults_to_auto_when_omitted() {
+        let parsed = parse_ok(
+            r#"
+            [finder.plain]
+            source = { type = "command", command = "git" }
+            outcome = { type = "open_path" }
+            "#,
+        );
+
+        let finder = parsed.finders.get("plain").expect("finder present");
+        assert_eq!(finder.run_on, RunOn::Auto);
+    }
+
+    #[test]
+    fn run_on_local_parses() {
+        let parsed = parse_ok(
+            r#"
+            [finder.local-only]
+            run_on = "local"
+            source = { type = "command", command = "rg" }
+            outcome = { type = "open_path" }
+            "#,
+        );
+
+        let finder = parsed.finders.get("local-only").expect("finder present");
+        assert_eq!(finder.run_on, RunOn::Local);
+    }
+
+    #[test]
+    fn an_unknown_run_on_value_is_rejected() {
+        let parsed = parse_ok(
+            r#"
+            [finder.futuristic]
+            run_on = "mars"
+            source = { type = "command", command = "git" }
+            outcome = { type = "open_path" }
+            "#,
+        );
+
+        assert!(parsed.finders.is_empty());
+        let error = parsed.errors.get("futuristic").expect("finder error present");
+        assert!(error.contains("run_on"), "unexpected error: {error}");
     }
 }

@@ -5,6 +5,7 @@ mod finder_tests;
 mod list;
 mod outcome;
 mod positioned_preview;
+mod remote;
 mod registry;
 mod source;
 
