@@ -148,11 +148,12 @@ async fn first_non_empty_line(
 
 pub fn resolve_entry_path(entry: &str, cwd: &Path) -> PathBuf {
     let path = Path::new(entry);
-    if path.is_absolute() {
+    let joined = if path.is_absolute() {
         path.to_path_buf()
     } else {
         cwd.join(path)
-    }
+    };
+    util::paths::normalize_lexically(&joined).unwrap_or(joined)
 }
 
 /// The Preview resolves the selected Entry the same way, so what it shows is
@@ -325,9 +326,21 @@ fn open_path(
 ) {
     workspace
         .update(cx, |workspace, cx| {
-            let fs = workspace.project().read(cx).fs().clone();
+            let project = workspace.project().clone();
+
+            let local_fs = project.read(cx).fs().clone();
+            let in_worktree = project
+                .read(cx)
+                .project_path_for_absolute_path(&target.path, cx)
+                .map(|project_path| {
+                    project.read(cx).entry_for_path(&project_path, cx).is_some()
+                });
+
             cx.spawn_in(window, async move |workspace, cx| {
-                let exists = fs.metadata(&target.path).await.ok().flatten().is_some();
+                let exists = match in_worktree {
+                    Some(exists) => exists,
+                    None => local_fs.metadata(&target.path).await.ok().flatten().is_some(),
+                };
                 let open = workspace.update_in(cx, |workspace, window, cx| {
                     if !exists {
                         workspace
@@ -468,6 +481,14 @@ mod tests {
         assert_eq!(
             resolve_entry_path("src/main.rs", Path::new("/project")),
             PathBuf::from("/project/src/main.rs")
+        );
+    }
+
+    #[test]
+    fn a_dot_prefixed_entry_is_normalized() {
+        assert_eq!(
+            resolve_entry_path("./oxmpl/src/main.rs", Path::new("/project")),
+            PathBuf::from("/project/oxmpl/src/main.rs")
         );
     }
 
