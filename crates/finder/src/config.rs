@@ -11,6 +11,11 @@ pub enum Source {
         command: String,
         #[serde(default)]
         args: Vec<String>,
+        /// Exit codes (beyond 0) to treat as success rather than failure.
+        /// Tools like `rg` exit 1 for "no matches" and `git diff` exits 1 for
+        /// "changes found"; both are empty-or-success, not errors.
+        #[serde(default)]
+        success_exit_codes: Vec<i32>,
     },
     /// Re-runs per Query with [`QUERY_PLACEHOLDER`] substituted into `args`.
     /// Rejected at parse time if no arg carries the placeholder.
@@ -18,6 +23,8 @@ pub enum Source {
         command: String,
         #[serde(default)]
         args: Vec<String>,
+        #[serde(default)]
+        success_exit_codes: Vec<i32>,
     },
 }
 
@@ -31,6 +38,19 @@ impl Source {
     pub fn args(&self) -> &[String] {
         match self {
             Source::Command { args, .. } | Source::Query { args, .. } => args,
+        }
+    }
+
+    pub fn success_exit_codes(&self) -> &[i32] {
+        match self {
+            Source::Command {
+                success_exit_codes,
+                ..
+            }
+            | Source::Query {
+                success_exit_codes,
+                ..
+            } => success_exit_codes,
         }
     }
 
@@ -345,6 +365,7 @@ mod tests {
             Source::Command {
                 command: "git".into(),
                 args: vec!["ls-files".into()],
+                success_exit_codes: Vec::new(),
             }
         );
         assert_eq!(finder.outcome, Outcome::OpenPath { path: None });
@@ -587,6 +608,7 @@ mod tests {
             Source::Command {
                 command: "git".into(),
                 args: vec!["ls-files".into(), "--cached".into(), "--others".into()],
+                success_exit_codes: Vec::new(),
             }
         );
     }
@@ -796,6 +818,7 @@ mod tests {
             Source::Query {
                 command: "rg".into(),
                 args: vec!["--line-number".into(), "{query}".into()],
+                success_exit_codes: Vec::new(),
             }
         );
         assert!(finder.source.is_query_driven());
@@ -836,6 +859,30 @@ mod tests {
             substitute_query(&["rg".into(), "--files".into()], "foo"),
             vec!["rg", "--files"],
         );
+    }
+
+    #[test]
+    fn success_exit_codes_parse_and_default_to_empty() {
+        let parsed = parse_ok(
+            r#"
+            [finder.demo]
+            source = { type = "command", command = "git", success_exit_codes = [1, 2] }
+            outcome = { type = "open_path" }
+            "#,
+        );
+
+        let finder = parsed.finders.get("demo").expect("finder present");
+        assert_eq!(finder.source.success_exit_codes(), &[1, 2]);
+
+        let parsed = parse_ok(
+            r#"
+            [finder.default]
+            source = { type = "command", command = "git" }
+            outcome = { type = "open_path" }
+            "#,
+        );
+        let finder = parsed.finders.get("default").expect("finder present");
+        assert!(finder.source.success_exit_codes().is_empty());
     }
 
     #[test]

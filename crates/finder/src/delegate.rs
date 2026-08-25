@@ -195,10 +195,17 @@ impl FinderDelegate {
         let run_on = self.config.run_on;
         let executor = cx.background_executor().clone();
         let remote_transport = project.read(cx).remote_client();
-        let (command, args) = match &self.config.source {
-            Source::Command { command, args } | Source::Query { command, args } => {
-                (command.clone(), args.clone())
+        let (command, args, success_exit_codes) = match &self.config.source {
+            Source::Command {
+                command,
+                args,
+                success_exit_codes,
             }
+            | Source::Query {
+                command,
+                args,
+                success_exit_codes,
+            } => (command.clone(), args.clone(), success_exit_codes.clone()),
         };
 
         let environment = project.update(cx, |project, cx| {
@@ -226,9 +233,11 @@ impl FinderDelegate {
             ) {
                 Ok(resolved) => Some(cx.background_spawn(run_source(
                     runner,
+                    command,
                     resolved.command,
                     resolved.args,
                     resolved.cwd.map(Arc::from),
+                    success_exit_codes,
                     resolved.env,
                     executor,
                     sender,
@@ -301,6 +310,7 @@ impl FinderDelegate {
 
         let command = config.source.command().to_owned();
         let args = substitute_query(config.source.args(), &query);
+        let success_exit_codes = config.source.success_exit_codes().to_vec();
         let runner = source_runner(cx);
         let run_on = config.run_on;
         let remote_transport = project.read(cx).remote_client();
@@ -353,9 +363,11 @@ impl FinderDelegate {
             ) {
                 Ok(resolved) => Some(cx.background_spawn(run_source(
                     runner,
+                    command,
                     resolved.command,
                     resolved.args,
                     resolved.cwd.map(Arc::from),
+                    success_exit_codes,
                     resolved.env,
                     executor,
                     sender,
